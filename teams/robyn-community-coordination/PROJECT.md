@@ -1,7 +1,7 @@
-# Robin: community energy coordination
+# Robyn: community energy coordination
 
 - **Project name:** FlexGrid
-- **People:** Robin
+- **People:** Robyn
 - **Last updated:** 2026-11-06
 
 ## What we are building

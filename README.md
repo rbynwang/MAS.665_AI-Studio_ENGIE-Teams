@@ -6,7 +6,7 @@ One shared place for the four teams working on the energy problem. Each team has
 | --- | --- | --- | --- |
 | Walmy | Trust layer | [PROJECT.md](teams/walmy-trust-layer/PROJECT.md) | [code](teams/walmy-trust-layer/code) |
 | Cooper | Buyer side and payment protection | [PROJECT.md](teams/cooper-buyer-side/PROJECT.md) | [code](teams/cooper-buyer-side/code) |
-| Robin | Community energy coordination | [PROJECT.md](teams/robin-community-coordination/PROJECT.md) | [code](teams/robin-community-coordination/code) |
+| Robyn | Community energy coordination | [PROJECT.md](teams/robyn-community-coordination/PROJECT.md) | [code](teams/robyn-community-coordination/code) |
 | Team 4 | To be confirmed | [PROJECT.md](teams/team-4/PROJECT.md) | [code](teams/team-4/code) |
 
 ## Posting your work
