@@ -1,6 +1,6 @@
 # MAS.665 AI Studio: ENGIE teams
 
-One shared place for the four teams working on the energy problem. Each team has its own folder, and each folder has a `PROJECT.md` that people and AI assistants can read.
+One shared place for the four teams working on the energy agentic network. Each team has its own folder, and each folder has a `PROJECT.md` that people and AI assistants can read.
 
 | Team | Focus | Project file | Code |
 | --- | --- | --- | --- |
