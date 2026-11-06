@@ -14,8 +14,14 @@ Grid operators, utilities and data centers are out of scope.
 
 **Working now:**
 
+All of this runs on simulated devices. No real device is connected yet.
+
+- Community coordinator, day-ahead market and gap handling every 5 minutes
+- Home agents with signed messages over NANDA Town
+- 5-minute planning for each home's battery, car and cooling
 - Trained load, solar and car forecasting models for homes
-- Agent tools for home and building nodes
+- Settlement from signed meter readings
+- A large building node, built and tested but not live
 
 **In progress:**
 
@@ -29,7 +35,7 @@ Grid operators, utilities and data centers are out of scope.
 
 ## How to run or see it
 
-Code and demo links to be added.
+The source code isn't posted yet. See the [system architecture](docs/ARCHITECTURE.md) and [code structure](docs/CODE_STRUCTURE.md).
 
 ## What we take in and what we give out
 
@@ -43,3 +49,6 @@ Code and demo links to be added.
 - **Trust layer (Walmy):** a way to catch a correctly signed offer that overstates what a node can deliver
 
 ## Links
+
+- [System architecture](docs/ARCHITECTURE.md)
+- [Code structure](docs/CODE_STRUCTURE.md)
