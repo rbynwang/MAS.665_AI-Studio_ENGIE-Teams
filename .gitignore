@@ -1,0 +1,24 @@
+# Secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+id_rsa*
+id_ed25519*
+credentials*.json
+secrets*
+
+# System and editor files
+.DS_Store
+.vscode/
+.idea/
+
+# Build output and dependencies
+node_modules/
+__pycache__/
+*.pyc
+.venv/
+venv/
+dist/
+build/
