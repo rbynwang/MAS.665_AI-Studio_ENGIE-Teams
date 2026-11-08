@@ -2,7 +2,7 @@
 
 - **Project name:** FlexGrid
 - **People:** Robyn
-- **Last updated:** 2026-11-06
+- **Last updated:** 2026-11-08
 
 ## What we are building
 
@@ -35,7 +35,7 @@ All of this runs on simulated devices. No real device is connected yet.
 
 ## How to run or see it
 
-The source code isn't posted yet. See the [system architecture](docs/ARCHITECTURE.md) and [code structure](docs/CODE_STRUCTURE.md).
+The code for Homework 8 is in [code](code): the package, the offline simulator and a small data pack, all simulated. Its [README](code/README.md) says how to install it and play a market day offline. The live deployment, trained models and user interfaces aren't posted. See the [system architecture](docs/ARCHITECTURE.md) and [code structure](docs/CODE_STRUCTURE.md).
 
 ## What we take in and what we give out
 

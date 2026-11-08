@@ -1,6 +1,6 @@
 # FlexGrid code structure
 
-The source code isn't posted here yet. This page describes how it's organized.
+The part posted for Homework 8 is in [code](../code): `flexgrid_core/`, the offline simulator in `tools/` and a small data pack. The other folders below aren't posted. This page describes how the whole project is organized.
 
 ## Folders
 
