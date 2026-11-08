@@ -1,0 +1,101 @@
+{
+ "source": "stage2/tiers2.py",
+ "homes": {
+  "hh-001": {
+   "synthetic_home": "BOS-R010",
+   "ua_kw_per_c": 0.471,
+   "cap_kwh_per_c": 8.641,
+   "tau_h": 18.35,
+   "cool_cap_kw": 11.13,
+   "cooling_type": "window_ac",
+   "heat_pump": false,
+   "window_fraction": 0.5583589728993333,
+   "setpoint_summer_c": 24.38,
+   "comfort_band_c": 1.56
+  },
+  "hh-002": {
+   "synthetic_home": "BOS-R035",
+   "ua_kw_per_c": 0.2413,
+   "cap_kwh_per_c": 3.964,
+   "tau_h": 16.43,
+   "cool_cap_kw": 4.69,
+   "cooling_type": "window_ac",
+   "heat_pump": false,
+   "window_fraction": 0.6979712028005917,
+   "setpoint_summer_c": 23.1,
+   "comfort_band_c": 1.23
+  },
+  "hh-039": {
+   "synthetic_home": "BOS-R011",
+   "ua_kw_per_c": 0.2531,
+   "cap_kwh_per_c": 4.481,
+   "tau_h": 17.7,
+   "cool_cap_kw": 7.593,
+   "cooling_type": "central_ac",
+   "heat_pump": false,
+   "window_fraction": null,
+   "setpoint_summer_c": 24.69,
+   "comfort_band_c": 1.3
+  },
+  "hh-071": {
+   "synthetic_home": "BED-B084",
+   "ua_kw_per_c": 0.3266,
+   "cap_kwh_per_c": 5.012,
+   "tau_h": 15.34,
+   "cool_cap_kw": 13.106,
+   "cooling_type": "heat_pump",
+   "heat_pump": true,
+   "window_fraction": null,
+   "setpoint_summer_c": 23.96,
+   "comfort_band_c": 1.54
+  },
+  "hh-084": {
+   "synthetic_home": "LAW-R033",
+   "ua_kw_per_c": 0.4353,
+   "cap_kwh_per_c": 8.467,
+   "tau_h": 19.45,
+   "cool_cap_kw": 13.058,
+   "cooling_type": "central_ac",
+   "heat_pump": false,
+   "window_fraction": null,
+   "setpoint_summer_c": 23.28,
+   "comfort_band_c": 1.94
+  },
+  "hh-090": {
+   "synthetic_home": "LAW-B061",
+   "ua_kw_per_c": 0.2678,
+   "cap_kwh_per_c": 3.298,
+   "tau_h": 12.31,
+   "cool_cap_kw": 10.856,
+   "cooling_type": "heat_pump",
+   "heat_pump": true,
+   "window_fraction": null,
+   "setpoint_summer_c": 23.01,
+   "comfort_band_c": 1.96
+  },
+  "hh-139": {
+   "synthetic_home": "WOR-R034",
+   "ua_kw_per_c": 0.2843,
+   "cap_kwh_per_c": 5.333,
+   "tau_h": 18.76,
+   "cool_cap_kw": 9.569,
+   "cooling_type": "heat_pump",
+   "heat_pump": true,
+   "window_fraction": null,
+   "setpoint_summer_c": 23.97,
+   "comfort_band_c": 1.82
+  },
+  "hh-197": {
+   "synthetic_home": "NOR-R005",
+   "ua_kw_per_c": 0.3072,
+   "cap_kwh_per_c": 6.775,
+   "tau_h": 22.06,
+   "cool_cap_kw": 9.215,
+   "cooling_type": "central_ac",
+   "heat_pump": false,
+   "window_fraction": null,
+   "setpoint_summer_c": 24.4,
+   "comfort_band_c": 1.95
+  }
+ }
+}

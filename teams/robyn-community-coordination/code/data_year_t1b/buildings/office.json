@@ -1,0 +1,53 @@
+{
+ "name": "bld-office",
+ "kind": "building",
+ "label": "Simulated office tower, 90th percentile size for Boston (a profile, not any building's meter)",
+ "short": "Office",
+ "profile": "buildings/office",
+ "place": {
+  "name": "Boston, MA (simulated site, no real address)",
+  "lat": 42.36,
+  "lon": -71.06
+ },
+ "floor_area_sqft": 760000,
+ "cooled_share": 1,
+ "thermal": {
+  "ua_kw_per_c": 82.7,
+  "cap_kwh_per_c": 782.8,
+  "tau_h": 9.5,
+  "cool_cap_kw": 2942.6,
+  "cool_kw_per_c": 18.8,
+  "cooling_type": "plant",
+  "keeps_cold": true,
+  "how": "heat store: 1.03 Wh per C per sq ft, the kept building model; heat lost per C: the cooling's weather response times COP 4.4; capacity 1.25 times the highest load"
+ },
+ "lighting": {
+  "open_kw": 210.5,
+  "closed_kw": 132.8,
+  "dim_max_share": 0.5
+ },
+ "schedule": {
+  "t_in_open_c": 22.8,
+  "t_in_closed_c": 25.0
+ },
+ "battery": {
+  "kwh": 0.0,
+  "kw": 0.0,
+  "eta": 0.95,
+  "reserve_pct": 0.0,
+  "soc_max_pct": 100.0,
+  "soc0_pct": 0.0,
+  "source": "none"
+ },
+ "sell": {
+  "fans": 0.5,
+  "plugs": 0.2
+ },
+ "free": 0.85,
+ "limits": {
+  "max_rise_c": 1.5,
+  "max_rise_away_c": 2.775,
+  "precool_c": 1.0,
+  "light_dim_max": 0.5
+ }
+}

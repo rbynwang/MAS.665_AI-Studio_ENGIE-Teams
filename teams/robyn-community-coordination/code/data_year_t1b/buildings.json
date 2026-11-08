@@ -1,0 +1,91 @@
+{
+ "buildings": [
+  {
+   "name": "bld-university",
+   "kind": "building",
+   "label": "Simulated university campus (a profile, not any campus's meter)",
+   "short": "University",
+   "profile": "buildings/university",
+   "place": {
+    "name": "Boston, MA (simulated site, no real address)",
+    "lat": 42.36,
+    "lon": -71.06
+   },
+   "floor_area_sqft": 7010000.0,
+   "battery": {
+    "kwh": 4210.5,
+    "kw": 1000.0,
+    "eta": 0.95,
+    "reserve_pct": 25.0,
+    "soc_max_pct": 100.0,
+    "soc0_pct": 100.0,
+    "source": "Campus battery, signed off in Stage 0. Reserve: the card's proposal"
+   },
+   "has_ev": false,
+   "export_limit_kw": 5000.0,
+   "host": "jetson-a",
+   "params": "buildings/university.json",
+   "daemon_port": 7875,
+   "monitor_url": "http://127.0.0.1:7885"
+  },
+  {
+   "name": "bld-mall",
+   "kind": "building",
+   "label": "Simulated shopping center (a profile, not any center's meter)",
+   "short": "Shopping center",
+   "profile": "buildings/mall",
+   "place": {
+    "name": "Boston, MA (simulated site, no real address)",
+    "lat": 42.36,
+    "lon": -71.06
+   },
+   "floor_area_sqft": 724357,
+   "battery": {
+    "kwh": 0.0,
+    "kw": 0.0,
+    "eta": 0.95,
+    "reserve_pct": 0.0,
+    "soc_max_pct": 100.0,
+    "soc0_pct": 0.0,
+    "source": "none"
+   },
+   "has_ev": false,
+   "export_limit_kw": 0.0,
+   "host": "jetson-a",
+   "params": "buildings/mall.json",
+   "daemon_port": 7876,
+   "monitor_url": "http://127.0.0.1:7886"
+  },
+  {
+   "name": "bld-office",
+   "kind": "building",
+   "label": "Simulated office tower, 90th percentile size for Boston (a profile, not any building's meter)",
+   "short": "Office",
+   "profile": "buildings/office",
+   "place": {
+    "name": "Boston, MA (simulated site, no real address)",
+    "lat": 42.36,
+    "lon": -71.06
+   },
+   "floor_area_sqft": 760000,
+   "battery": {
+    "kwh": 0.0,
+    "kw": 0.0,
+    "eta": 0.95,
+    "reserve_pct": 0.0,
+    "soc_max_pct": 100.0,
+    "soc0_pct": 0.0,
+    "source": "none"
+   },
+   "has_ev": false,
+   "export_limit_kw": 0.0,
+   "host": "jetson-a",
+   "params": "buildings/office.json",
+   "daemon_port": 7877,
+   "monitor_url": "http://127.0.0.1:7887"
+  }
+ ],
+ "notes": [
+  "Simulated profiles. Yearly totals are sized from public BERDO figures and the shapes come from a fitted model: none of this is a meter reading from any real site."
+ ]
+}

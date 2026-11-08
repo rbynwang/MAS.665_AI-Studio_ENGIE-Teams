@@ -1,0 +1,67 @@
+{
+ "name": "ma_year_t1b",
+ "label": "Massachusetts sample pack: 8 simulated homes and 3 simulated buildings, 2026-01-01 to 2026-01-28 and 2026-06-01 to 2026-07-03",
+ "tz_offset_h": -4,
+ "tz_label": "local",
+ "tz_name": "America/New_York",
+ "range": [
+  "2026-01-01",
+  "2026-07-03"
+ ],
+ "baseline_from": "2026-01-08",
+ "replay_start": "2026-01-01 00:00",
+ "events_file": "grid_events.json",
+ "default_event": "2026-06-29",
+ "holidays": [
+  "2026-01-01",
+  "2026-01-19",
+  "2026-06-19",
+  "2026-07-03"
+ ],
+ "agent_defaults": {
+  "clock_profile": "homes/HH001",
+  "profile": "homes/HH001"
+ },
+ "profile_alias": {
+  "tesla_calhoun": "homes/HH001",
+  "enphase_jackson": "homes/HH002"
+ },
+ "site_labels": {},
+ "price_label": "Flat placeholder: $50 per MWh at every step. Not a market price",
+ "program_label": "Test buyer stand-in: $2.04 per kWh reduced",
+ "community": {
+  "name": "Five Massachusetts towns",
+  "lat": 42.36,
+  "lon": -71.06
+ },
+ "models": "models/forecast_2025_26",
+ "models_2026": "models/forecast_2026",
+ "school_breaks": [
+  [
+   "2026-01-01",
+   "2026-01-02"
+  ],
+  [
+   "2026-02-16",
+   "2026-02-20"
+  ],
+  [
+   "2026-04-20",
+   "2026-04-24"
+  ],
+  [
+   "2026-06-27",
+   "2026-07-03"
+  ]
+ ],
+ "ranges": [
+  [
+   "2026-01-01",
+   "2026-01-28"
+  ],
+  [
+   "2026-06-01",
+   "2026-07-03"
+  ]
+ ]
+}

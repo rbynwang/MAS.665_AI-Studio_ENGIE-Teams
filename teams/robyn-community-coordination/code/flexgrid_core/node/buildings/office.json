@@ -1,0 +1,250 @@
+{
+ "key": "office",
+ "node": "bld-office",
+ "schedule": "office",
+ "place": "at the office",
+ "label": "Office building",
+ "basis": "The schedule's four spaces are mapped on the level map's 25 floors in the same 3:3:2:1. Everything else is by area: assigned: no public source gives this split.",
+ "spaces": {
+  "low": {
+   "schedule": "Floors 1-3",
+   "names": "floors 1 to 8",
+   "area": 0.32,
+   "share": {
+    "cool": 0.32,
+    "fans": 0.32,
+    "light": 0.32,
+    "plugs": 0.32
+   }
+  },
+  "mid": {
+   "schedule": "Floors 4-6",
+   "names": "floors 9 to 16",
+   "area": 0.32,
+   "share": {
+    "cool": 0.32,
+    "fans": 0.32,
+    "light": 0.32,
+    "plugs": 0.32
+   }
+  },
+  "high": {
+   "schedule": "Floors 7-8",
+   "names": "floors 17 to 22",
+   "area": 0.24,
+   "share": {
+    "cool": 0.24,
+    "fans": 0.24,
+    "light": 0.24,
+    "plugs": 0.24
+   }
+  },
+  "vacant": {
+   "schedule": "Vacant floors",
+   "names": "floors 23 to 25, closed",
+   "area": 0.12,
+   "share": {
+    "cool": 0.12,
+    "fans": 0.12,
+    "light": 0.12,
+    "plugs": 0.12
+   },
+   "closed": true
+  }
+ },
+ "sale_free": 0.85,
+ "off_plant_share": 0.0,
+ "off_plant_says": "",
+ "plants": {
+  "office-plant": {
+   "cool_share": 1.0,
+   "lab_share": 0.0,
+   "full_kw": 335.3,
+   "stop": true,
+   "says": "the office plant",
+   "loop_list": true,
+   "normal_off": "21:00",
+   "chillers": [
+    {
+     "name": "office-chiller-1",
+     "product": "Daikin WMT",
+     "count": 1,
+     "floor": 70,
+     "running": true
+    },
+    {
+     "name": "office-chiller-2",
+     "product": "Trane Agility",
+     "count": 1,
+     "floor": 40,
+     "running": false
+    }
+   ]
+  }
+ },
+ "targets": {
+  "set_plant_demand_limit": [
+   {
+    "target": "office-plant"
+   }
+  ],
+  "stop_plant_early": [
+   {
+    "target": "office-plant"
+   }
+  ],
+  "set_zone_cooling": [
+   {
+    "target": "office-zones",
+    "spaces": [
+     "low",
+     "mid",
+     "high",
+     "vacant"
+    ],
+    "whole": true
+   },
+   {
+    "target": "low-floors-zones",
+    "spaces": [
+     "low"
+    ]
+   },
+   {
+    "target": "mid-floors-zones",
+    "spaces": [
+     "mid"
+    ]
+   },
+   {
+    "target": "high-floors-zones",
+    "spaces": [
+     "high"
+    ]
+   },
+   {
+    "target": "vacant-floors-zones",
+    "spaces": [
+     "vacant"
+    ]
+   }
+  ],
+  "set_zone_standby": [
+   {
+    "target": "office-free-floors-zones",
+    "spaces": [
+     "low",
+     "mid",
+     "high"
+    ],
+    "whole": true
+   },
+   {
+    "target": "low-floors-zones",
+    "spaces": [
+     "low"
+    ]
+   },
+   {
+    "target": "mid-floors-zones",
+    "spaces": [
+     "mid"
+    ]
+   },
+   {
+    "target": "high-floors-zones",
+    "spaces": [
+     "high"
+    ]
+   },
+   {
+    "target": "vacant-floors-zones",
+    "spaces": [
+     "vacant"
+    ]
+   }
+  ],
+  "limit_air_handler": [
+   {
+    "target": "office-air-handlers",
+    "kw_share": 1.0,
+    "speed_now": 92.0,
+    "floor_percent": 73.0,
+    "spaces": [
+     "low",
+     "mid",
+     "high",
+     "vacant"
+    ]
+   }
+  ],
+  "dim_lights": [
+   {
+    "target": "office-lights",
+    "spaces": [
+     "low",
+     "mid",
+     "high",
+     "vacant"
+    ],
+    "whole": true
+   },
+   {
+    "target": "low-floors-lights",
+    "spaces": [
+     "low"
+    ]
+   },
+   {
+    "target": "mid-floors-lights",
+    "spaces": [
+     "mid"
+    ]
+   },
+   {
+    "target": "high-floors-lights",
+    "spaces": [
+     "high"
+    ]
+   },
+   {
+    "target": "vacant-floors-lights",
+    "spaces": [
+     "vacant"
+    ]
+   }
+  ],
+  "switch_plugs": [
+   {
+    "target": "free-floors-plugs",
+    "spaces": [
+     "low",
+     "mid",
+     "high",
+     "vacant"
+    ],
+    "holds": "printers, screens and task lights on free floors"
+   }
+  ]
+ },
+ "limits": {
+  "light_pct": 50,
+  "top_c": 26.9
+ },
+ "avoid": [],
+ "instead": {},
+ "never": [
+  "closet",
+  "server",
+  "idf",
+  "network",
+  "stair",
+  "exit",
+  "elevator-machine",
+  "fire-command"
+ ],
+ "open": [
+  "The signed loop list is set as on file here, as the sale assumes. Without it the guard blocks the stop: loop_list in this map.",
+  "Standby is set as commissioned on every floor: Daikin AO:40 at the area rate."
+ ]
+}

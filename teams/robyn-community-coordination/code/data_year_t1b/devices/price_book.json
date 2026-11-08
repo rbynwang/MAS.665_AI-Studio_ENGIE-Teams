@@ -1,0 +1,47 @@
+{
+ "note": "Published Massachusetts program rates. The conversions to a price per kWh are ours, and each says so.",
+ "sources": {
+  "statewide_plan": "2025-2027 Statewide Plan, Exhibit 1, Figures 29 and 39, D.P.U. 24-140 to 24-149, as read by the Boston Energy Atlas: https://bostonenergyatlas.org/entity#decision:connectedsolutions",
+  "home_battery_materials": "Massachusetts residential battery program materials, 13 Mar 2026: https://www.capelightcompact.org/wp-content/uploads/2025/02/ma_resi_battery_program_materials-3-13-26_CLEAN.pdf",
+  "two_way_car": "National Grid statement in Electrek, 23 Jul 2026: https://electrek.co/2026/07/23/massachusetts-ev-drivers-battery-power-v2g/",
+  "managed_charging": "Eversource managed charging page, read 5 Nov 2026; 2027 amounts pending: https://www.eversource.com/residential/save-money-energy/clean-energy-options/electric-vehicles/ev-charger-managed-charging"
+ },
+ "program": {
+  "months": "June to September",
+  "events_per_season": "30 to 60",
+  "event_length_h": "2 or 3",
+  "event_hours": "15:00 to 20:00",
+  "winter_rate": null,
+  "note": "Neither the plan nor the March 2026 materials shows a winter rate. FlexGrid's own sale windows come from ISO-NE's real peak and stay as signed off."
+ },
+ "massachusetts_today": {
+  "home_battery_usd_per_kw": 275.0,
+  "two_way_car_usd_per_kw": 275.0,
+  "business_daily_usd_per_kw": 200.0,
+  "business_targeted_usd_per_kw": 45.0,
+  "thermostat_per_year_usd": 20.0,
+  "managed_charging_per_year_usd": 120.0,
+  "battery_income_per_participant_usd": {
+   "massachusetts_2025_average": 1028,
+   "tesla_average_2023": 1298,
+   "tesla_average_2024": 1492,
+   "tesla_net_estimate_one_powerwall_3": 800
+  }
+ },
+ "event_hours": 135.0,
+ "event_price_usd_kwh": 2.04,
+ "event_price_basis": "$275 per kW over 45 three-hour events, the middle of the program's 30 to 60. Our conversion. The market test's stand-in buyer pays this price.",
+ "coordinator_keeps": 0.2,
+ "coordinator_keeps_basis": "Assumed: the old book's $220 net on $275. No published fee.",
+ "x": {
+  "home_battery": 0.8,
+  "building": 0.58,
+  "home_other": 0.21
+ },
+ "x_basis": {
+  "home_battery": "$275 less the coordinator's 20%. Two-way cars count here.",
+  "building": "$200 Daily Dispatch over $275, less 20%. A building's own battery counts here too.",
+  "home_other": "No per-kW rate exists. Real payments are $20 a thermostat and $120 a managed charger a year: $140 over the 1.97 kW these devices sell in a Tier 1 home is $71 per kW, then less 20%. Water heaters, appliances and pools have no real rate of their own."
+ },
+ "same_day_adjustment": true
+}

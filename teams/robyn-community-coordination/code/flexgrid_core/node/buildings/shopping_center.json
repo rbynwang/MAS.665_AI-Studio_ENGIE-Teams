@@ -1,0 +1,183 @@
+{
+ "key": "shopping_center",
+ "node": "bld-mall",
+ "schedule": "mall",
+ "place": "at the shopping center",
+ "label": "Shopping center",
+ "basis": "Spaces and hours are stage 1's. Lights 80/20 and the plant's 80% are the level map's. Fans 144 and 193 of 482 kW are the card's. The rest is assigned: no public source gives this split.",
+ "spaces": {
+  "common": {
+   "schedule": "Common areas",
+   "names": "arcades, Center Court and the bridge",
+   "area": 0.2,
+   "share": {
+    "cool": 0.2,
+    "fans": 0.3,
+    "light": 0.2,
+    "plugs": 1.0
+   },
+   "smoke_ok": true
+  },
+  "stores": {
+   "schedule": "Stores",
+   "names": "inline stores and large tenants",
+   "area": 0.6,
+   "share": {
+    "cool": 0.6,
+    "fans": 0.4,
+    "light": 0.6,
+    "plugs": 0.0
+   },
+   "tenant_fans": 0.085
+  },
+  "food": {
+   "schedule": "Food hall",
+   "names": "food tenants on their own rooftop units",
+   "area": 0.2,
+   "share": {
+    "cool": 0.2,
+    "fans": 0.3,
+    "light": 0.2,
+    "plugs": 0.0
+   },
+   "off_plant": true
+  }
+ },
+ "sale_free": 0.0,
+ "off_plant_share": 0.2,
+ "off_plant_says": "tenant rooftop units",
+ "plants": {
+  "mall-plant": {
+   "cool_share": 0.8,
+   "lab_share": 0.0,
+   "full_kw": 641.0,
+   "stop": false,
+   "says": "the mall's share of the plant",
+   "chillers": [
+    {
+     "name": "mall-chiller-1",
+     "product": "Carrier 19DV",
+     "count": 1,
+     "floor": 40,
+     "running": true
+    },
+    {
+     "name": "mall-chiller-2",
+     "product": "Daikin WMT",
+     "count": 1,
+     "floor": 70,
+     "running": true
+    }
+   ]
+  }
+ },
+ "targets": {
+  "limit_ev_charging": [
+   {
+    "target": "mall-level-2-ports",
+    "ports": 6,
+    "volts": 240.0,
+    "leaves": "21:30",
+    "product": "Autel AC Ultra, stand-in"
+   }
+  ],
+  "set_plant_demand_limit": [
+   {
+    "target": "mall-plant"
+   }
+  ],
+  "set_zone_cooling": [
+   {
+    "target": "mall-zones",
+    "spaces": [
+     "common",
+     "stores",
+     "food"
+    ],
+    "whole": true
+   },
+   {
+    "target": "common-area-zones",
+    "spaces": [
+     "common"
+    ]
+   },
+   {
+    "target": "store-zones",
+    "spaces": [
+     "stores"
+    ]
+   },
+   {
+    "target": "tenant-rooftop-zones",
+    "spaces": [
+     "food"
+    ]
+   }
+  ],
+  "limit_air_handler": [
+   {
+    "target": "common-area-air-handlers",
+    "kw_share": 0.2988,
+    "speed_now": 100.0,
+    "floor_percent": 92.0,
+    "spaces": [
+     "common"
+    ]
+   }
+  ],
+  "dim_lights": [
+   {
+    "target": "store-lights",
+    "spaces": [
+     "stores",
+     "food"
+    ]
+   },
+   {
+    "target": "common-area-lights",
+    "spaces": [
+     "common"
+    ]
+   }
+  ],
+  "switch_plugs": [
+   {
+    "target": "kiosk-plugs",
+    "spaces": [
+     "common"
+    ],
+    "holds": "kiosk displays and back-of-house loads",
+    "any_time": true
+   }
+  ]
+ },
+ "limits": {
+  "light_pct": 25,
+  "open_light_pct": 25,
+  "precool_c": 0.5,
+  "top_c": 25.3
+ },
+ "avoid": [],
+ "instead": {
+  "mall-tesla-dc-ports": {
+   "why": "Those ports have no control path.",
+   "target": "mall-level-2-ports"
+  }
+ },
+ "never": [
+  "stair",
+  "exit",
+  "tower",
+  "kitchen",
+  "hood",
+  "garage",
+  "network",
+  "idf",
+  "tunnel"
+ ],
+ "open": [
+  "Each common unit's smoke role is set as ruled out here, as the sale assumes. A real site must prove it unit by unit: smoke_ok in this map.",
+  "Whose meter carries the plant is unknown."
+ ]
+}

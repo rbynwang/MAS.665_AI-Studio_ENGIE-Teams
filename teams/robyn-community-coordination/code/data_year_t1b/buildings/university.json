@@ -1,0 +1,53 @@
+{
+ "name": "bld-university",
+ "kind": "building",
+ "label": "Simulated university campus (a profile, not any campus's meter)",
+ "short": "University",
+ "profile": "buildings/university",
+ "place": {
+  "name": "Boston, MA (simulated site, no real address)",
+  "lat": 42.36,
+  "lon": -71.06
+ },
+ "floor_area_sqft": 7010000.0,
+ "cooled_share": 0.84,
+ "thermal": {
+  "ua_kw_per_c": 894.4,
+  "cap_kwh_per_c": 6065.1,
+  "tau_h": 6.8,
+  "cool_cap_kw": 33317.3,
+  "cool_kw_per_c": 203.3,
+  "cooling_type": "plant",
+  "keeps_cold": true,
+  "how": "heat store: 1.03 Wh per C per sq ft, the kept building model; heat lost per C: the cooling's weather response times COP 4.4; capacity 1.25 times the highest load"
+ },
+ "lighting": {
+  "open_kw": 1724.3,
+  "closed_kw": 761.1,
+  "dim_max_share": 0.5
+ },
+ "schedule": {
+  "t_in_open_c": 22.8,
+  "t_in_closed_c": 25.0
+ },
+ "battery": {
+  "kwh": 4210.5,
+  "kw": 1000.0,
+  "eta": 0.95,
+  "reserve_pct": 25.0,
+  "soc_max_pct": 100.0,
+  "soc0_pct": 100.0,
+  "source": "Campus battery, signed off in Stage 0. Reserve: the card's proposal"
+ },
+ "sell": {
+  "fans": 0.5,
+  "plugs": 0.174
+ },
+ "free": 0.85,
+ "limits": {
+  "max_rise_c": 1.5,
+  "max_rise_away_c": 2.775,
+  "precool_c": 1.0,
+  "light_dim_max": 0.5
+ }
+}

@@ -1,0 +1,755 @@
+{
+ "home": {
+  "set_battery": {
+   "category": "energy_storage",
+   "model_view": {
+    "description": "Charges, discharges or holds the battery. Use when a sale needs stored power: discharge in the window, charge or hold before. Not when 0 kW are owed, the battery shut off under 10 minutes ago, or a maker's event runs.",
+    "parameters": [
+     {
+      "name": "target",
+      "type": "enum",
+      "unit": "",
+      "allowed": "home-battery",
+      "required": true,
+      "says": "the home battery"
+     },
+     {
+      "name": "action",
+      "type": "enum",
+      "unit": "",
+      "allowed": "charge | discharge | hold",
+      "required": true,
+      "says": "discharge gives power, charge stores more, hold saves it for the sale"
+     },
+     {
+      "name": "kw",
+      "type": "number",
+      "unit": "kW",
+      "allowed": "Above 0 up to can_give_kw on a discharge, above 0 up to the charge limit on a charge, exactly 0 with hold. Code fills in the numbers. Never negative",
+      "required": true,
+      "says": "power in kW, not stored kWh. Above 0, up to the limit shown. 0 only with hold"
+     },
+     {
+      "name": "start",
+      "type": "time",
+      "unit": "HH:MM",
+      "allowed": "Local time. A time already past today means tomorrow. Code fills it from the window for a discharge in a sale step",
+      "required": true,
+      "says": "when it begins"
+     },
+     {
+      "name": "end",
+      "type": "time",
+      "unit": "HH:MM",
+      "allowed": "Local time, after start. Earlier than start means the next morning. Code fills it from the window for a discharge in a sale step. A charge or hold ends by the window's start",
+      "required": true,
+      "says": "when it stops by itself"
+     }
+    ],
+    "example": "set_battery(target=\"home-battery\", action=\"discharge\", kw=4.4, start=\"18:00\", end=\"21:00\")"
+   }
+  },
+  "limit_ev_charging": {
+   "category": "ev_charging",
+   "model_view": {
+    "description": "Lowers or pauses car charging until the end time. Use when a sale has kW owed and car status is charging. Not when 0 kW are owed, or car status is idle, capped, giving, away or reserved.",
+    "parameters": [
+     {
+      "name": "target",
+      "type": "enum",
+      "unit": "",
+      "allowed": "car-charger",
+      "required": true,
+      "says": "the home's car charger"
+     },
+     {
+      "name": "amps",
+      "type": "number",
+      "unit": "A",
+      "allowed": "0, or 6 to 32. Code shows this home's own numbers",
+      "required": true,
+      "says": "amps allowed, not kW. 0 pauses. Use the lowest offered"
+     },
+     {
+      "name": "start",
+      "type": "time",
+      "unit": "HH:MM",
+      "allowed": "Local time. Code fills it from the sale window",
+      "required": true,
+      "says": "when the limit begins"
+     },
+     {
+      "name": "end",
+      "type": "time",
+      "unit": "HH:MM",
+      "allowed": "Local time, after start. Code fills it from the sale window",
+      "required": true,
+      "says": "when charging goes back to normal"
+     }
+    ],
+    "example": "limit_ev_charging(target=\"car-charger\", amps=0, start=\"18:00\", end=\"21:00\")"
+   }
+  },
+  "discharge_car": {
+   "category": "ev_charging",
+   "model_view": {
+    "description": "Sends car power to the home. Use when car status is idle and kW are owed after the battery gives all it can. Not when 0 kW are owed, or car status is charging, capped, giving, away or reserved.",
+    "parameters": [
+     {
+      "name": "target",
+      "type": "enum",
+      "unit": "",
+      "allowed": "car",
+      "required": true,
+      "says": "the home's car"
+     },
+     {
+      "name": "kw",
+      "type": "number",
+      "unit": "kW",
+      "allowed": "Above 0, up to can_give_kw",
+      "required": true,
+      "says": "the smaller of kW owed and can_give_kw"
+     },
+     {
+      "name": "max_kwh",
+      "type": "number",
+      "unit": "kWh",
+      "allowed": "Above 0, up to the number code shows",
+      "required": true,
+      "says": "kWh limit, not kW. Copy the number shown"
+     },
+     {
+      "name": "start",
+      "type": "time",
+      "unit": "HH:MM",
+      "allowed": "Local time. Code fills it from the sale window",
+      "required": true,
+      "says": "when sending begins"
+     },
+     {
+      "name": "end",
+      "type": "time",
+      "unit": "HH:MM",
+      "allowed": "Local time, after start. Code fills it from the sale window",
+      "required": true,
+      "says": "when sending stops"
+     }
+    ],
+    "example": "discharge_car(target=\"car\", kw=1.4, max_kwh=20.6, start=\"18:00\", end=\"21:00\")"
+   }
+  },
+  "set_thermostat": {
+   "category": "hvac_zones",
+   "model_view": {
+    "description": "Changes the thermostat until the end time. Use when central air or a heat pump runs and kW are owed, or to pre-cool or pre-heat. Not when 0 kW are owed, can_give_kw is 0, or the owner just changed it.",
+    "parameters": [
+     {
+      "name": "target",
+      "type": "enum",
+      "unit": "",
+      "allowed": "main-thermostat",
+      "required": true,
+      "says": "which thermostat"
+     },
+     {
+      "name": "less_comfort_c",
+      "type": "number",
+      "unit": "C",
+      "allowed": "Plus is warmer when cooling and cooler when heating. Minus stores cool or warmth first. Code shows this home's own numbers, and only the sign that fits this step.",
+      "required": true,
+      "says": "degrees C less comfortable: 0.5 to 2.8 in a sale, -0.4 to -1.4 before a sale"
+     },
+     {
+      "name": "start",
+      "type": "time",
+      "unit": "HH:MM",
+      "allowed": "Local time. Code fills it",
+      "required": true,
+      "says": "when the change begins"
+     },
+     {
+      "name": "end",
+      "type": "time",
+      "unit": "HH:MM",
+      "allowed": "Local time, after start. Code fills it",
+      "required": true,
+      "says": "when the normal setting comes back"
+     }
+    ],
+    "example": "set_thermostat(target=\"main-thermostat\", less_comfort_c=1.5, start=\"18:00\", end=\"21:00\")"
+   }
+  },
+  "set_room_ac": {
+   "category": "hvac_zones",
+   "model_view": {
+    "description": "Changes window air conditioners until the end time. Use when a window unit is cooling and kW are owed, or to pre-cool. Not when 0 kW are owed, that unit's can_give_kw is 0, or the owner just changed that unit.",
+    "parameters": [
+     {
+      "name": "target",
+      "type": "enum",
+      "unit": "",
+      "allowed": "all-room-acs | room-ac-1 | room-ac-2 | room-ac-3 | room-ac-4",
+      "required": true,
+      "says": "all-room-acs if every unit is cooling, else each cooling unit by name"
+     },
+     {
+      "name": "less_comfort_c",
+      "type": "number",
+      "unit": "C",
+      "allowed": "Plus is warmer. Minus pre-cools. Code rounds to the unit's step, so give the number as shown. Code shows this home's own numbers, and only the sign that fits this step.",
+      "required": true,
+      "says": "degrees C less comfortable: 0.6 to 2.8 in a sale, -0.6 to -1.4 before a sale"
+     },
+     {
+      "name": "start",
+      "type": "time",
+      "unit": "HH:MM",
+      "allowed": "Local time. Code fills it",
+      "required": true,
+      "says": "when the change begins"
+     },
+     {
+      "name": "end",
+      "type": "time",
+      "unit": "HH:MM",
+      "allowed": "Local time, after start. Code fills it",
+      "required": true,
+      "says": "when the normal setting comes back"
+     }
+    ],
+    "example": "set_room_ac(target=\"all-room-acs\", less_comfort_c=1.5, start=\"18:00\", end=\"21:00\")"
+   }
+  },
+  "set_water_heater": {
+   "category": "water_heating",
+   "model_view": {
+    "description": "Stops or starts water heating. Use when a sale is on or coming: hold in it, load_up a below-normal tank before. Not when 0 kW are owed, hot water reads low for hold, or a sale is on for load_up.",
+    "parameters": [
+     {
+      "name": "target",
+      "type": "enum",
+      "unit": "",
+      "allowed": "water-heater",
+      "required": true,
+      "says": "the water heater"
+     },
+     {
+      "name": "action",
+      "type": "enum",
+      "unit": "",
+      "allowed": "hold | load_up",
+      "required": true,
+      "says": "hold stops heating, load_up heats first"
+     },
+     {
+      "name": "start",
+      "type": "time",
+      "unit": "HH:MM",
+      "allowed": "Local time. Code fills it in",
+      "required": true,
+      "says": "when it begins"
+     },
+     {
+      "name": "end",
+      "type": "time",
+      "unit": "HH:MM",
+      "allowed": "Local time, after start. Code fills it in",
+      "required": true,
+      "says": "when it ends by itself"
+     }
+    ],
+    "example": "set_water_heater(target=\"water-heater\", action=\"hold\", start=\"18:00\", end=\"21:00\")"
+   }
+  },
+  "delay_appliance": {
+   "category": "appliances",
+   "model_view": {
+    "description": "Delays a dryer or dishwasher. Use when kW are owed and it reads waiting. Not when 0 kW are owed, the machine is running or would miss the done-by time, or a dryer would run with people asleep or out.",
+    "parameters": [
+     {
+      "name": "target",
+      "type": "enum",
+      "unit": "",
+      "allowed": "dryer | dishwasher",
+      "required": true,
+      "says": "which machine"
+     },
+     {
+      "name": "finish_by",
+      "type": "time",
+      "unit": "HH:MM",
+      "allowed": "Copy the owner's done-by time",
+      "required": true,
+      "says": "latest time it may finish"
+     },
+     {
+      "name": "start",
+      "type": "time",
+      "unit": "HH:MM",
+      "allowed": "Local time. Code fills it in",
+      "required": true,
+      "says": "when the wait begins"
+     },
+     {
+      "name": "end",
+      "type": "time",
+      "unit": "HH:MM",
+      "allowed": "Local time, after start. Code fills it in",
+      "required": true,
+      "says": "when the machine may start"
+     }
+    ],
+    "example": "delay_appliance(target=\"dishwasher\", finish_by=\"23:30\", start=\"18:00\", end=\"21:00\")"
+   }
+  },
+  "set_pool_pump": {
+   "category": "pools_and_water_features",
+   "model_view": {
+    "description": "Slows the pool pump until the end time. Use when kW are owed and the pump reads running. Not when 0 kW are owed, the pump reads 33 percent or less, air reads cold, or filter hours read short.",
+    "parameters": [
+     {
+      "name": "target",
+      "type": "enum",
+      "unit": "",
+      "allowed": "pool-pump",
+      "required": true,
+      "says": "the pool pump"
+     },
+     {
+      "name": "speed_percent",
+      "type": "number",
+      "unit": "percent",
+      "allowed": "Code fills in this pump's range. 0 stops it, only if no other speed is allowed",
+      "required": true,
+      "says": "percent of top speed, 33 for a sale"
+     },
+     {
+      "name": "start",
+      "type": "time",
+      "unit": "HH:MM",
+      "allowed": "Local time. Code fills it in",
+      "required": true,
+      "says": "when it begins"
+     },
+     {
+      "name": "end",
+      "type": "time",
+      "unit": "HH:MM",
+      "allowed": "Local time, after start. Code fills it in",
+      "required": true,
+      "says": "when it ends by itself"
+     }
+    ],
+    "example": "set_pool_pump(target=\"pool-pump\", speed_percent=33, start=\"18:00\", end=\"21:00\")"
+   }
+  }
+ },
+ "building": {
+  "set_zone_cooling": {
+   "category": "hvac_zones",
+   "model_view": {
+    "description": "Lets a zone group run warmer, or pre-cools it, until the end time. Use when cooling runs, a sale needs less and the zone is still normal, or to pre-cool. Not in labs, closets or rooms in an exam.",
+    "parameters": [
+     {
+      "name": "target",
+      "type": "enum",
+      "unit": "",
+      "allowed": "office-free-floors-zones | floors-5-20-zones | floor-7-zones | floor-12-zones | office-zones | campus-booked-zones | room-204-zone | hall-3-zones | floor-3-office-zones | mall-zones | center-court-zones | store-zones",
+      "required": true,
+      "says": "which zones, from this node's list"
+     },
+     {
+      "name": "offset_c",
+      "type": "number",
+      "unit": "C",
+      "allowed": "-1 to 1.5, up to 3 only in empty zones. Code fills in this zone's limit, which can be lower. Mall pre-cool stops at -0.5",
+      "required": true,
+      "says": "degrees C warmer, minus for cooler, -1 to 1.5, up to 3 if empty"
+     },
+     {
+      "name": "start",
+      "type": "time",
+      "unit": "HH:MM",
+      "allowed": "Local time. Code fills it: the sale's start in empty zones, 30 minutes earlier where people may be in",
+      "required": true,
+      "says": "when the change begins"
+     },
+     {
+      "name": "end",
+      "type": "time",
+      "unit": "HH:MM",
+      "allowed": "Local time, after start. Code fills it from the sale window",
+      "required": true,
+      "says": "when cooling goes back to normal"
+     }
+    ],
+    "example": "set_zone_cooling(target=\"floors-5-20-zones\", offset_c=3, start=\"18:00\", end=\"21:00\")"
+   }
+  },
+  "limit_air_handler": {
+   "category": "hvac_zones",
+   "model_view": {
+    "description": "Caps how fast an air handler's fans run until the end time. Use when a sale needs less fan power and its zones already run warmer or sit in standby. Not to stop fans, and not on outdoor air units.",
+    "parameters": [
+     {
+      "name": "target",
+      "type": "enum",
+      "unit": "",
+      "allowed": "office-air-handlers | ahu-2 | ahu-3 | common-area-air-handlers | center-court-ahu | campus-non-lab-air-handlers | wing-ahu | standalone-rooftop-2",
+      "required": true,
+      "says": "which fans, from this node's list"
+     },
+     {
+      "name": "speed_percent",
+      "type": "number",
+      "unit": "percent",
+      "allowed": "50 to 100. Code fills in this unit's floor, which can be higher",
+      "required": true,
+      "says": "fan speed left, percent of full speed, 50 to 100"
+     },
+     {
+      "name": "start",
+      "type": "time",
+      "unit": "HH:MM",
+      "allowed": "Local time. Code fills it from the sale window",
+      "required": true,
+      "says": "when the cap begins"
+     },
+     {
+      "name": "end",
+      "type": "time",
+      "unit": "HH:MM",
+      "allowed": "Local time, after start. Code fills it from the sale window",
+      "required": true,
+      "says": "when the fans go back to normal"
+     }
+    ],
+    "example": "limit_air_handler(target=\"office-air-handlers\", speed_percent=73, start=\"18:00\", end=\"21:00\")"
+   }
+  },
+  "set_zone_standby": {
+   "category": "hvac_zones",
+   "model_view": {
+    "description": "Lets a free zone cut air and cooling until the end time. Use when a zone is free or a wing is closed, before a fan cap. Not if the building is open and any room lacks a sensor.",
+    "parameters": [
+     {
+      "name": "target",
+      "type": "enum",
+      "unit": "",
+      "allowed": "standalone-bldg-zones | floors-20-25-wing | floor-4-zones | floor-7-zones | floor-9-zones | floor-9-north-zones | student-center-zones | east-wing-zones",
+      "required": true,
+      "says": "which zones, from this node's list"
+     },
+     {
+      "name": "mode",
+      "type": "enum",
+      "unit": "",
+      "allowed": "on | off",
+      "required": true,
+      "says": "on lets standby run, off keeps the zone on its normal schedule"
+     },
+     {
+      "name": "start",
+      "type": "time",
+      "unit": "HH:MM",
+      "allowed": "Local time. Code fills it: 15 minutes before the sale, or when the wing closes",
+      "required": true,
+      "says": "when the mode begins"
+     },
+     {
+      "name": "end",
+      "type": "time",
+      "unit": "HH:MM",
+      "allowed": "Local time, after start. Code fills it, at least 60 minutes before any booking",
+      "required": true,
+      "says": "when the zone goes back to its schedule"
+     }
+    ],
+    "example": "set_zone_standby(target=\"standalone-bldg-zones\", mode=\"on\", start=\"17:45\", end=\"21:00\")"
+   }
+  },
+  "set_plant_demand_limit": {
+   "category": "central_plant",
+   "model_view": {
+    "description": "Lowers how hard the chillers can run, as a percent of full power. Use when zones already run warmer, a sale needs less cooling and the plant must keep running. Not when the plant is cleared to stop.",
+    "parameters": [
+     {
+      "name": "target",
+      "type": "enum",
+      "unit": "",
+      "allowed": "central-loop-plant | science-loop-plant | standalone-1-plant | mall-plant | office-plant | office-chiller-1 | office-chiller-2",
+      "required": true,
+      "says": "which plant or chiller"
+     },
+     {
+      "name": "limit_percent",
+      "type": "number",
+      "unit": "percent",
+      "allowed": "30 to 100. Code fills in the floor for this target, which can be 40 or 70",
+      "required": true,
+      "says": "highest percent of full power allowed, 30 to 100"
+     },
+     {
+      "name": "start",
+      "type": "time",
+      "unit": "HH:MM",
+      "allowed": "Local time. Code fills it from the sale window",
+      "required": true,
+      "says": "when the cap begins"
+     },
+     {
+      "name": "end",
+      "type": "time",
+      "unit": "HH:MM",
+      "allowed": "Local time, after start. Code fills it from the sale window",
+      "required": true,
+      "says": "when the cap ends by itself"
+     }
+    ],
+    "example": "set_plant_demand_limit(target=\"mall-plant\", limit_percent=71, start=\"18:00\", end=\"21:00\")"
+   }
+  },
+  "stop_plant_early": {
+   "category": "central_plant",
+   "model_view": {
+    "description": "Stops the whole cooling plant until the end time. Use when a sale needs all the cooling power and the plant is cleared to stop. Not for a plant that serves labs or is shared with another building.",
+    "parameters": [
+     {
+      "name": "target",
+      "type": "enum",
+      "unit": "",
+      "allowed": "office-plant | standalone-1-plant",
+      "required": true,
+      "says": "which whole plant"
+     },
+     {
+      "name": "start",
+      "type": "time",
+      "unit": "HH:MM",
+      "allowed": "Local time. Code fills it from the sale window",
+      "required": true,
+      "says": "when the plant stops"
+     },
+     {
+      "name": "end",
+      "type": "time",
+      "unit": "HH:MM",
+      "allowed": "Local time, after start, at or after the plant's normal off time. Code fills it",
+      "required": true,
+      "says": "when the normal schedule returns"
+     }
+    ],
+    "example": "stop_plant_early(target=\"office-plant\", start=\"18:00\", end=\"21:00\")"
+   }
+  },
+  "dim_lights": {
+   "category": "lighting_and_shading",
+   "model_view": {
+    "description": "Lowers the lights in one group by a percent until the end time. Use when a sale needs less lighting power and that group's lights are on, free groups first. Not on stairs, exit signs, emergency lights or security lights.",
+    "parameters": [
+     {
+      "name": "target",
+      "type": "enum",
+      "unit": "",
+      "allowed": "floor-12-lights | floor-7-lights | floor-9-conference-lights | floor-12-office-lights | store-lights | common-area-lights | campus-lights",
+      "required": true,
+      "says": "which lights, from this node's list"
+     },
+     {
+      "name": "cut_percent",
+      "type": "number",
+      "unit": "percent",
+      "allowed": "1 to 50, or 100 for off. Code fills in this group's limit, which can be lower. 100 shows only for an empty group away from exit routes",
+      "required": true,
+      "says": "percent to cut, not the level left: 1 to 50, or 100 for off"
+     },
+     {
+      "name": "start",
+      "type": "time",
+      "unit": "HH:MM",
+      "allowed": "Local time. Code fills it, 30 minutes before the sale so the fade ends as the window opens. For 100 it fills now",
+      "required": true,
+      "says": "when the fade begins"
+     },
+     {
+      "name": "end",
+      "type": "time",
+      "unit": "HH:MM",
+      "allowed": "Local time, after start. Code fills it from the sale window",
+      "required": true,
+      "says": "when lights go back"
+     }
+    ],
+    "example": "dim_lights(target=\"floor-12-lights\", cut_percent=50, start=\"17:30\", end=\"21:00\")"
+   }
+  },
+  "switch_plugs": {
+   "category": "plug_loads",
+   "model_view": {
+    "description": "Turns off wall outlets in one group until the end time. Use when a sale needs less outlet power and rooms are empty, or for a kiosk group. Not in other occupied rooms, or for network, security or medical loads.",
+    "parameters": [
+     {
+      "name": "target",
+      "type": "enum",
+      "unit": "",
+      "allowed": "floor-20-plugs | free-rooms-plugs | kiosk-plugs | room-204-screen-plugs",
+      "required": true,
+      "says": "which outlets, from this node's list"
+     },
+     {
+      "name": "state",
+      "type": "enum",
+      "unit": "",
+      "allowed": "off | auto",
+      "required": true,
+      "says": "off turns them off, auto gives them back"
+     },
+     {
+      "name": "start",
+      "type": "time",
+      "unit": "HH:MM",
+      "allowed": "Local time. Code fills it from the sale window, or now for auto",
+      "required": true,
+      "says": "when it takes effect"
+     },
+     {
+      "name": "end",
+      "type": "time",
+      "unit": "HH:MM",
+      "allowed": "Local time, after start. Code fills it from the sale window",
+      "required": true,
+      "says": "when outlets go back"
+     }
+    ],
+    "example": "switch_plugs(target=\"floor-20-plugs\", state=\"off\", start=\"18:00\", end=\"21:00\")"
+   }
+  },
+  "set_battery": {
+   "category": "energy_storage",
+   "model_view": {
+    "description": "Charges, discharges or holds the campus battery. Use when a sale needs stored power: discharge in its window, charge or hold before. Not when a utility command is on, or the battery tripped in the last 10 minutes.",
+    "parameters": [
+     {
+      "name": "target",
+      "type": "enum",
+      "unit": "",
+      "allowed": "campus-battery",
+      "required": true,
+      "says": "the campus battery"
+     },
+     {
+      "name": "action",
+      "type": "enum",
+      "unit": "",
+      "allowed": "charge | discharge | hold",
+      "required": true,
+      "says": "discharge gives power, charge stores it, hold keeps it"
+     },
+     {
+      "name": "kw",
+      "type": "number",
+      "unit": "kW",
+      "allowed": "0 to can_give_kw on a discharge, 0 to the charge limit on a charge, 0 with hold. Code fills in the numbers. Power, not stored kWh. Never negative",
+      "required": true,
+      "says": "AC kW, up to about 1,000"
+     },
+     {
+      "name": "start",
+      "type": "time",
+      "unit": "HH:MM",
+      "allowed": "Local time. In a sale step, code fills it from the window",
+      "required": true,
+      "says": "when it begins"
+     },
+     {
+      "name": "end",
+      "type": "time",
+      "unit": "HH:MM",
+      "allowed": "Local time. Earlier than start means the next morning. In a sale step, code fills it from the window",
+      "required": true,
+      "says": "when it ends by itself"
+     }
+    ],
+    "example": "set_battery(target=\"campus-battery\", action=\"discharge\", kw=1000, start=\"18:00\", end=\"21:00\")"
+   }
+  },
+  "limit_ev_charging": {
+   "category": "ev_charging",
+   "model_view": {
+    "description": "Lowers or pauses EV charging on a port group until the end time. Use when a sale needs less power and cars are charging. Not when no car is charging, or a car must leave before the end time.",
+    "parameters": [
+     {
+      "name": "target",
+      "type": "enum",
+      "unit": "",
+      "allowed": "mall-level-2-ports | office-garage-ports | office-blink-ports | office-port-4",
+      "required": true,
+      "says": "which ports, from this node's list"
+     },
+     {
+      "name": "amps",
+      "type": "number",
+      "unit": "A",
+      "allowed": "Amps on each port, not kW. 0 to pause, or 6 to 80. Nothing between 0 and 6. Code fills in this port's range",
+      "required": true,
+      "says": "0, or 6 to 80 amps"
+     },
+     {
+      "name": "start",
+      "type": "time",
+      "unit": "HH:MM",
+      "allowed": "Local time. In a sale step, code fills it from the window",
+      "required": true,
+      "says": "when the limit begins"
+     },
+     {
+      "name": "end",
+      "type": "time",
+      "unit": "HH:MM",
+      "allowed": "Local time. Earlier than start means the next morning. In a sale step, code fills it from the window",
+      "required": true,
+      "says": "when charging goes back to normal"
+     }
+    ],
+    "example": "limit_ev_charging(target=\"mall-level-2-ports\", amps=0, start=\"18:00\", end=\"21:00\")"
+   }
+  }
+ },
+ "common": {
+  "no_action": {
+   "category": "common",
+   "model_view": {
+    "description": "Does nothing this step. Use when no tool is needed, a Not when line fits the situation, an alarm is active, or the device has nothing to give.",
+    "example": "no_action(reason=\"0 kW owed\")",
+    "parameters": [
+     {
+      "name": "reason",
+      "type": "string",
+      "unit": "",
+      "allowed": "a few words",
+      "required": true,
+      "says": "why nothing is done"
+     }
+    ]
+   }
+  },
+  "read_device": {
+   "category": "common",
+   "model_view": {
+    "description": "Reads one device's current state. Use when the step didn't give a reading you need. Not to change anything: it only reads.",
+    "example": "read_device(target=\"floor-12-lights\")",
+    "parameters": [
+     {
+      "name": "target",
+      "type": "enum",
+      "unit": "",
+      "allowed": "this node's devices",
+      "required": true,
+      "says": "which device"
+     }
+    ]
+   }
+  }
+ }
+}

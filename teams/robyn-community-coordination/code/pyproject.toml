@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "flexgrid-core"
+version = "0.2.0"
+description = "FlexGrid home/coordinator agent core: device adapters, envelopes, signing, NANDA Town client, executor daemon"
+requires-python = ">=3.10"
+readme = "README.md"
+license = {text = "Apache-2.0"}
+dependencies = ["fastapi", "uvicorn", "httpx", "pydantic>=2", "cryptography", "pandas", "numpy", "scipy"]
+
+[project.optional-dependencies]
+agent = ["mcp>=1.2"]          # flexgrid-mcp: the MCP tools a buyer agent uses (Hermes, OpenClaw, Claude Code, ...)
+
+[project.scripts]
+flexgridd = "flexgrid_core.daemon:main"
+flexgrid-coordinator = "flexgrid_core.coordinator:main"
+flexgrid-fleet = "flexgrid_core.fleet:main"
+flexgrid-utility = "flexgrid_core.utility:main"
+flexgrid-dc = "flexgrid_core.dc_fleet:main"
+flexgrid-mcp = "flexgrid_core.mcp_server:main"
+
+[tool.setuptools.packages.find]
+include = ["flexgrid_core*"]
+
+[tool.setuptools.package-data]
+flexgrid_core = ["node/*.json", "node/*.npz", "node/buildings/*.json", "node/buildings/*.npz"]

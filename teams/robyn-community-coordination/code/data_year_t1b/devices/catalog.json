@@ -1,0 +1,135 @@
+{
+ "devices": {
+  "home": {
+   "hpwh": {
+    "label": "Heat pump water heater",
+    "kind": "shift",
+    "kw": 1.7,
+    "share": 1.0,
+    "order": 1,
+    "path": "CTA-2045 port, or the maker's app"
+   },
+   "pool": {
+    "label": "Pool pump",
+    "kind": "shift",
+    "kw": 1.35,
+    "share": 1.0,
+    "order": 2,
+    "path": "Maker's app"
+   },
+   "dryer": {
+    "label": "Clothes dryer",
+    "kind": "shift",
+    "kw": 5.6,
+    "share": 1.0,
+    "order": 3,
+    "path": "Maker's cloud"
+   },
+   "spa": {
+    "label": "Hot tub heater",
+    "kind": "shift",
+    "kw": 3.0,
+    "share": 1.0,
+    "order": 4,
+    "path": "Maker's app"
+   },
+   "dish": {
+    "label": "Dishwasher",
+    "kind": "shift",
+    "kw": 1.2,
+    "share": 1.0,
+    "order": 5,
+    "path": "Maker's cloud"
+   },
+   "fridge": {
+    "label": "Refrigerators",
+    "kind": "shift",
+    "kw": 0.15,
+    "share": 0.5,
+    "order": 6,
+    "path": "Wi-Fi app"
+   },
+   "freezer": {
+    "label": "Freezer",
+    "kind": "shift",
+    "kw": 0.15,
+    "share": 0.5,
+    "order": 7,
+    "path": "Smart plug"
+   },
+   "dehum": {
+    "label": "Dehumidifier",
+    "kind": "shed",
+    "kw": 0.5,
+    "share": 1.0,
+    "path": "Wi-Fi app or smart plug"
+   },
+   "lighting": {
+    "label": "Smart lighting",
+    "kind": "shed",
+    "kw": 0.2,
+    "share": 0.3,
+    "path": "Matter, Zigbee, Lutron"
+   },
+   "plugs": {
+    "label": "TV and smart plugs",
+    "kind": "shed",
+    "kw": 0.2,
+    "share": 0.2,
+    "path": "Matter plugs"
+   },
+   "v2h": {
+    "label": "Car, two-way charger",
+    "kind": "source",
+    "kw": 9.6,
+    "share": 1.0,
+    "event_kwh": 15.0,
+    "eff": 0.9,
+    "path": "Maker's cloud API"
+   }
+  },
+  "building": {
+   "fans": {
+    "label": "Fans",
+    "kind": "shed",
+    "kw": 0.0,
+    "share": 1.0,
+    "path": "BACnet to the drives, through the building system"
+   },
+   "plugs": {
+    "label": "Plug loads",
+    "kind": "shed",
+    "kw": 0.0,
+    "share": 1.0,
+    "path": "Plug relays, through their hubs"
+   },
+   "ev": {
+    "label": "EV charging",
+    "kind": "shift",
+    "kw": 10.8,
+    "share": 1.0,
+    "order": 3,
+    "path": "OCPP"
+   }
+  }
+ },
+ "rows": {
+  "home": {
+   "hh-001": 0,
+   "hh-002": 1,
+   "hh-039": 2,
+   "hh-071": 3,
+   "hh-084": 4,
+   "hh-090": 5,
+   "hh-139": 6,
+   "hh-197": 7
+  },
+  "building": {
+   "bld-university": 0,
+   "bld-mall": 1,
+   "bld-office": 2
+  }
+ },
+ "stagger_max_min": 120,
+ "catch_up_after_min": 90
+}

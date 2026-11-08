@@ -1,0 +1,54 @@
+{
+ "name": "bld-mall",
+ "kind": "building",
+ "label": "Simulated shopping center (a profile, not any center's meter)",
+ "short": "Shopping center",
+ "profile": "buildings/mall",
+ "place": {
+  "name": "Boston, MA (simulated site, no real address)",
+  "lat": 42.36,
+  "lon": -71.06
+ },
+ "floor_area_sqft": 724357,
+ "cooled_share": 1,
+ "thermal": {
+  "ua_kw_per_c": 210.3,
+  "cap_kwh_per_c": 746.1,
+  "tau_h": 3.5,
+  "cool_cap_kw": 7401.5,
+  "cool_kw_per_c": 47.8,
+  "cooling_type": "plant",
+  "keeps_cold": true,
+  "how": "heat store: 1.03 Wh per C per sq ft, the kept building model; heat lost per C: the cooling's weather response times COP 4.4; capacity 1.25 times the highest load"
+ },
+ "lighting": {
+  "open_kw": 809.4,
+  "closed_kw": 214.4,
+  "dim_max_share": 0.25
+ },
+ "schedule": {
+  "t_in_open_c": 22.8,
+  "t_in_closed_c": 25.0
+ },
+ "battery": {
+  "kwh": 0.0,
+  "kw": 0.0,
+  "eta": 0.95,
+  "reserve_pct": 0.0,
+  "soc_max_pct": 100.0,
+  "soc0_pct": 0.0,
+  "source": "none"
+ },
+ "sell": {
+  "fans": 0.15,
+  "plugs": 0.05,
+  "ev": 1.0
+ },
+ "free": 0.0,
+ "limits": {
+  "max_rise_c": 1.5,
+  "max_rise_away_c": 3.0,
+  "precool_c": 0.5,
+  "light_dim_max": 0.25
+ }
+}

@@ -1,0 +1,335 @@
+{
+ "key": "university",
+ "node": "bld-university",
+ "schedule": "university",
+ "place": "on campus",
+ "label": "University campus",
+ "basis": "Spaces and their dates are stage 1's. Area shares are assigned: no public source gives this split. Plant split from the level map: 70% of cooling on the loops, 60/40, 30% standalone, of which 20% rooftop units.",
+ "spaces": {
+  "classrooms": {
+   "schedule": "Classrooms",
+   "names": "classrooms and seminar rooms",
+   "area": 0.15,
+   "share": {
+    "cool": 0.15,
+    "fans": 0.15,
+    "light": 0.15,
+    "plugs": 0.15
+   },
+   "exams": true
+  },
+  "offices": {
+   "schedule": "Offices",
+   "names": "offices and departments",
+   "area": 0.2,
+   "share": {
+    "cool": 0.2,
+    "fans": 0.2,
+    "light": 0.2,
+    "plugs": 0.2
+   }
+  },
+  "halls": {
+   "schedule": "Residence halls",
+   "names": "residence halls",
+   "area": 0.35,
+   "share": {
+    "cool": 0.35,
+    "fans": 0.35,
+    "light": 0.35,
+    "plugs": 0.0
+   },
+   "hall": true
+  },
+  "student": {
+   "schedule": "Library and student center",
+   "names": "library reading rooms and the student center",
+   "area": 0.2,
+   "share": {
+    "cool": 0.2,
+    "fans": 0.2,
+    "light": 0.2,
+    "plugs": 0.2
+   }
+  },
+  "athletics": {
+   "schedule": "Athletics",
+   "names": "gyms and arenas",
+   "area": 0.1,
+   "share": {
+    "cool": 0.1,
+    "fans": 0.1,
+    "light": 0.1,
+    "plugs": 0.0
+   }
+  }
+ },
+ "sale_free": 0.85,
+ "off_plant_share": 0.06,
+ "off_plant_says": "rooftop units",
+ "plants": {
+  "central-loop-plant": {
+   "cool_share": 0.42,
+   "lab_share": 0.336,
+   "lab_margin": 0.1,
+   "full_kw": 3001.0,
+   "stop": false,
+   "says": "the Central loop",
+   "chillers": [
+    {
+     "name": "central-chillers",
+     "product": "Carrier 19DV",
+     "count": 5,
+     "floor": 40,
+     "running": true
+    }
+   ]
+  },
+  "science-loop-plant": {
+   "cool_share": 0.28,
+   "lab_share": 0.336,
+   "lab_margin": 0.1,
+   "full_kw": 2001.0,
+   "stop": false,
+   "says": "the Science loop",
+   "chillers": [
+    {
+     "name": "science-chillers",
+     "product": "Trane Agility",
+     "count": 5,
+     "floor": 40,
+     "running": true
+    }
+   ]
+  },
+  "standalone-1-plant": {
+   "cool_share": 0.24,
+   "lab_share": 0.0,
+   "full_kw": 998.0,
+   "stop": false,
+   "says": "the standalone buildings",
+   "chillers": [
+    {
+     "name": "standalone-chillers",
+     "product": "Carrier 30XV",
+     "count": 8,
+     "floor": 35,
+     "running": true
+    }
+   ]
+  }
+ },
+ "targets": {
+  "set_battery": [
+   {
+    "target": "campus-battery",
+    "rating_kw": 1043.0,
+    "product": "Generac SBE-B-4180-1000",
+    "trip_kw": 75.0,
+    "service_share": 0.25,
+    "charge_limit_kw": {
+     "06:00-11:00": 1000.0,
+     "11:00-15:00": 1000.0,
+     "15:00-22:00": 1000.0,
+     "22:00-06:00": 1000.0
+    },
+    "discharge_limit_kw": {
+     "07:00-12:00": 1000.0,
+     "12:00-15:00": 1000.0,
+     "15:00-19:00": 1000.0,
+     "19:00-07:00": 1000.0
+    }
+   }
+  ],
+  "set_plant_demand_limit": [
+   {
+    "target": "central-loop-plant"
+   },
+   {
+    "target": "science-loop-plant"
+   },
+   {
+    "target": "standalone-1-plant"
+   }
+  ],
+  "set_zone_cooling": [
+   {
+    "target": "campus-zones",
+    "spaces": [
+     "classrooms",
+     "offices",
+     "halls",
+     "student",
+     "athletics"
+    ],
+    "whole": true
+   },
+   {
+    "target": "classroom-zones",
+    "spaces": [
+     "classrooms"
+    ]
+   },
+   {
+    "target": "campus-office-zones",
+    "spaces": [
+     "offices"
+    ]
+   },
+   {
+    "target": "hall-zones",
+    "spaces": [
+     "halls"
+    ]
+   },
+   {
+    "target": "student-center-zones",
+    "spaces": [
+     "student"
+    ]
+   },
+   {
+    "target": "athletics-zones",
+    "spaces": [
+     "athletics"
+    ]
+   }
+  ],
+  "set_zone_standby": [
+   {
+    "target": "campus-free-zones",
+    "spaces": [
+     "classrooms",
+     "offices",
+     "student",
+     "athletics"
+    ],
+    "whole": true
+   },
+   {
+    "target": "classroom-zones",
+    "spaces": [
+     "classrooms"
+    ]
+   },
+   {
+    "target": "campus-office-zones",
+    "spaces": [
+     "offices"
+    ]
+   },
+   {
+    "target": "student-center-zones",
+    "spaces": [
+     "student"
+    ]
+   },
+   {
+    "target": "athletics-zones",
+    "spaces": [
+     "athletics"
+    ]
+   }
+  ],
+  "limit_air_handler": [
+   {
+    "target": "campus-non-lab-air-handlers",
+    "kw_share": 1.0,
+    "speed_now": 100.0,
+    "floor_percent": 79.0,
+    "spaces": [
+     "classrooms",
+     "offices",
+     "halls",
+     "student",
+     "athletics"
+    ]
+   }
+  ],
+  "dim_lights": [
+   {
+    "target": "campus-lights",
+    "spaces": [
+     "classrooms",
+     "offices",
+     "halls",
+     "student",
+     "athletics"
+    ],
+    "whole": true
+   },
+   {
+    "target": "classroom-lights",
+    "spaces": [
+     "classrooms"
+    ]
+   },
+   {
+    "target": "campus-office-lights",
+    "spaces": [
+     "offices"
+    ]
+   },
+   {
+    "target": "hall-lights",
+    "spaces": [
+     "halls"
+    ]
+   },
+   {
+    "target": "student-center-lights",
+    "spaces": [
+     "student"
+    ]
+   },
+   {
+    "target": "athletics-lights",
+    "spaces": [
+     "athletics"
+    ]
+   }
+  ],
+  "switch_plugs": [
+   {
+    "target": "free-rooms-plugs",
+    "spaces": [
+     "classrooms",
+     "offices",
+     "student"
+    ],
+    "holds": "AV, screens and printers in free rooms"
+   }
+  ]
+ },
+ "limits": {
+  "light_pct": 50
+ },
+ "avoid": [],
+ "instead": {
+  "campus-air-handlers": {
+   "why": "That group holds lab supply units, and labs are never touched.",
+   "target": "campus-non-lab-air-handlers"
+  }
+ },
+ "never": [
+  "lab",
+  "fume",
+  "animal",
+  "isolation",
+  "stack",
+  "museum",
+  "closet",
+  "server",
+  "network",
+  "idf",
+  "stair",
+  "exit",
+  "freezer",
+  "elevator-machine"
+ ],
+ "open": [
+  "Area shares and the rooftop share are assigned.",
+  "The lab load reading by loop, the lab floor margin and the pressure limit need the campus operator.",
+  "The standalone unit's min_lim is the card's test value, 35."
+ ]
+}

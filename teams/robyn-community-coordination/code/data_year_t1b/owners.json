@@ -1,0 +1,77 @@
+{
+ "tier": 1,
+ "homes": {
+  "hh-001": {
+   "max_rise_c": 1.83,
+   "max_rise_away_c": 2.86,
+   "precool_c": 0.96,
+   "respond": 0.976,
+   "online": 0.995,
+   "charge_kw": 7.08,
+   "v2h_kwh": 25.0
+  },
+  "hh-002": {
+   "max_rise_c": 1.71,
+   "max_rise_away_c": 2.73,
+   "precool_c": 0.36,
+   "respond": 0.876,
+   "online": 0.943,
+   "charge_kw": 8.0,
+   "v2h_kwh": 10.4
+  },
+  "hh-039": {
+   "max_rise_c": 1.86,
+   "max_rise_away_c": 2.73,
+   "precool_c": 0.32,
+   "respond": 0.932,
+   "online": 0.893,
+   "charge_kw": 7.0,
+   "v2h_kwh": 16.3
+  },
+  "hh-071": {
+   "max_rise_c": 2.72,
+   "max_rise_away_c": 4.0,
+   "precool_c": 1.04,
+   "respond": 0.964,
+   "online": 0.991,
+   "charge_kw": 8.0,
+   "v2h_kwh": 19.1
+  },
+  "hh-084": {
+   "max_rise_c": 1.52,
+   "max_rise_away_c": 2.45,
+   "precool_c": 0.9,
+   "respond": 0.921,
+   "online": 0.995,
+   "charge_kw": 11.5,
+   "v2h_kwh": 10.3
+  },
+  "hh-090": {
+   "max_rise_c": 1.31,
+   "max_rise_away_c": 3.12,
+   "precool_c": 0.67,
+   "respond": 0.992,
+   "online": 0.922,
+   "charge_kw": 11.5,
+   "v2h_kwh": 19.4
+  },
+  "hh-139": {
+   "max_rise_c": 3.0,
+   "max_rise_away_c": 4.93,
+   "precool_c": 0.9,
+   "respond": 0.97,
+   "online": 0.993,
+   "charge_kw": 20.0,
+   "v2h_kwh": 21.6
+  },
+  "hh-197": {
+   "max_rise_c": 1.65,
+   "max_rise_away_c": 3.35,
+   "precool_c": 1.39,
+   "respond": 0.971,
+   "online": 0.916,
+   "charge_kw": 8.19,
+   "v2h_kwh": 23.5
+  }
+ }
+}
