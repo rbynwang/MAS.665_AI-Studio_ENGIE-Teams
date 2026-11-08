@@ -31,6 +31,7 @@ PERSON_VERBS = ["read", "set_limit", "need_now", "close_group", "open_group", "c
 LIMITS: dict[str, dict[str, tuple[float, float]]] = {
     "hvac_zones": {"max_rise_c": (0.0, 4.0), "max_rise_away_c": (0.0, 4.0), "precool_c": (0.0, 3.0)},
     "energy_storage": {"reserve_pct": (0.0, 100.0)},
+    "lighting_and_shading": {"light_dim_max": (0.0, 0.5)},          # building.LIGHT_DIM_HARD_MAX
 }
 
 
@@ -42,6 +43,7 @@ class Who:
 
 
 AGENT = Who("agent", "model")
+CODE = Who("agent", "code")        # the node's own code, walking its list: the same rules, and the record says whose choice it was
 
 
 @lru_cache(maxsize=1)
@@ -131,13 +133,16 @@ class OwnerChannel:
     an old one can't be sent again, and names this node, so text a model read has no way in.
 
     apply(verb, group, name, value) does the change: context.py passes it down to the driver.
+    seq, save: the last number each signer's key used, and where that goes. A number is saved before the word does anything, so a reset, a restart or a word the node refused can't
+    let the same message in twice. A key that can't be saved stops the word: better a person signs again than a message that can be sent twice.
     """
 
     def __init__(self, node: str, policy: Policy, keys: dict[str, str], apply: Callable[[str, str, str, float | None], dict[str, Any]],
-                 record: Callable[..., Any] | None = None):
+                 record: Callable[..., Any] | None = None, seq: dict[str, int] | None = None, save: Callable[[dict[str, int]], Any] | None = None):
         self.node, self.policy, self.keys, self.apply = node, policy, dict(keys), apply
         self.record = record or (lambda *a, **k: None)
-        self.seq: dict[str, int] = {}
+        self.seq: dict[str, int] = dict(seq or {})
+        self.save = save or (lambda numbers: None)
 
     def receive(self, msg: dict[str, Any]) -> dict[str, Any]:
         m = msg if isinstance(msg, dict) else {}
@@ -159,7 +164,7 @@ class OwnerChannel:
         if msg.get("node") != self.node:
             return no("This message is for another node.")
         seq = msg.get("seq")
-        if not isinstance(seq, int) or isinstance(seq, bool) or seq <= self.seq.get(role, 0):
+        if not isinstance(seq, int) or isinstance(seq, bool) or seq <= self.seq.get(key, 0):
             return no("This message was already used.")
         v = self.policy.check(Who(role, "signed", True), verb, group)
         if not v["allow"]:
@@ -172,7 +177,11 @@ class OwnerChannel:
                 return no("That limit can't be set here.")
             if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or not rng[0] <= value <= rng[1]:
                 return no(f"{name} must be a number from {rng[0]:g} to {rng[1]:g}.")
-        self.seq[role] = seq
+        self.seq[key] = seq
+        try:
+            self.save(dict(self.seq))
+        except OSError as exc:
+            return no(f"This word can't be kept on disk, so nothing was done ({type(exc).__name__}). Sign it again.")
         if verb in ("close_group", "need_now"):
             self.policy.closed[group] = role
         elif verb == "open_group":

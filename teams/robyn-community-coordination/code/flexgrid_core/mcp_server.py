@@ -8,7 +8,7 @@ gets the result back, checks it (flexgrid_core/verify.py) and signs off.
 
   list_communities()                                       who sells flexibility, its size, the clock, the deadline
   get_grid_outlook()                                       today's real MISO grid: fuel mix, prices, the peak window
-  forecast_community_demand(date)                          the trained model's hourly 10/50/90 % demand forecast
+  forecast_community_demand(date)                          the community's hourly 10/50/90 % demand forecast
   request_flexibility(date, start, end, kw, price_usd_per_kwh, note)    place the order
   get_contract(event_id, wait_seconds)                     where the deal stands, step by step
   get_settlement(event_id, wait_seconds)                   kW contracted / delivered per slot, payment, split
@@ -33,7 +33,7 @@ import sys
 import time
 from typing import Any
 
-from . import beckn, community_forecast, config, verify
+from . import beckn, community_forecast, config, doors, verify
 
 INSTRUCTIONS = (
     "FlexGrid sells a neighborhood's demand flexibility (home batteries and EV charging that can be shifted) to a "
@@ -98,7 +98,7 @@ class Live:
         import httpx
         self.c = os.environ.get("FLEXGRID_COORDINATOR_URL", "http://127.0.0.1:7871").rstrip("/")
         self.u = os.environ.get("FLEXGRID_UTILITY_URL", "http://127.0.0.1:7873").rstrip("/")
-        self.http = httpx.Client(timeout=30)
+        self.http = httpx.Client(timeout=30, headers=doors.headers())
 
     def _get(self, base: str, path: str, **params) -> Any:
         r = self.http.get(base + path, params=params)
@@ -299,8 +299,8 @@ def build(backend, app: Any = None) -> Any:
 
     @app.tool()
     def forecast_community_demand(date: str) -> dict:
-        """The community's demand for every hour of `date` (YYYY-MM-DD) as FlexGrid's trained forecasting model sees
-        it at 10:00 the day before (the call for offers): 10 %, 50 % and 90 % values in kW for all the homes together
+        """The community's demand for every hour of `date` (YYYY-MM-DD) as FlexGrid's forecast, fitted to the community's
+        own meters, sees it at 10:00 the day before (the call for offers): 10 %, 50 % and 90 % values in kW for all the homes together
         (their base load; EVs are the homes' own flexibility), and the 3-hour evening window with the highest forecast
         demand. Use it to choose the window and the kW you order; the 10-90 % range is honest about uncertainty.
         Built only from the community's metered history and the weather forecast as issued, nothing from the day
@@ -320,10 +320,10 @@ def build(backend, app: Any = None) -> Any:
     def request_flexibility(date: str, start: str, end: str, kw: float, price_usd_per_kwh: float,
                             note: str = "") -> dict:
         """Order load relief from the community for one window. date: YYYY-MM-DD; start/end: local HH:MM on the
-        half hour (30 min to 4 h); kw: relief wanted in every 30-minute slot (max 500); price_usd_per_kwh: what you pay
-        per kWh delivered (max 5; list_communities shows what the area's program pays). Paid only on measured
-        delivery, capped at the kW the
-        community contracts. Returns the published order (event_id, signed by the utility)."""
+        half hour (30 min to 4 h); kw: relief wanted in every 30-minute slot (max 500); price_usd_per_kwh: the most you
+        pay per kWh delivered (max 5; list_communities shows what the area's program pays). Under the 2026 rules each
+        kWh costs its class's rate, which only a battery's kWh reaches. Paid only on measured delivery. Returns the
+        published order (event_id, signed by the utility)."""
         cap = float(os.environ.get("FLEXGRID_BUYER_MAX_PRICE") or 0)      # this buyer's own limit (the code decides)
         if cap and float(price_usd_per_kwh) > cap + 1e-9:
             return {"backend": backend.name, "accepted": False,

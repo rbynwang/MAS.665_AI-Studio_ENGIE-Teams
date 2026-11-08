@@ -10,8 +10,9 @@ What it watches (rules in code; the buyer's AI agent may raise or skip a call, b
 Payment for a call (per half hour, for the community as one unit, as the DEG settlement pays the booking):
   extra = the measured reduction of every meter the buyer has a reading from (baseline - use, never below 0 per meter)
           - the kW the booking already pays for in that half hour (the contract's capacity offered; 0 outside it)
-  paid  = min(extra, the kW called) x 0.5 h x the call's price (x the share of the half hour inside the call)
-The coordinator splits it between the homes it dispatched, by what each measured beyond its own booking.
+  full  = min(extra, the kW called) x 0.5 h x the call's price (x the share of the half hour inside the call)
+The coordinator splits it between the homes it dispatched, by what each measured beyond its own booking. Each gets the call's price times its class's share, and on the pool the buyer
+pays each class's own rate on those kWh, as in the booking (settlement.call_bill), so the coordinator keeps the same part of the bill. On the one-buyer path the buyer pays `full`.
 On the quiet path (report_rule.py) readings come in one batch after the window, so a call waits for them (cfg call_settle_after_min).
 Live, a call is settled an hour (dataset) after it ends, once no reading has come for `utility_settle_quiet_s` real
 seconds (30) and the coordinator has confirmed it (or 6 dataset hours have passed): through a busy NANDA Town the
@@ -21,10 +22,10 @@ coordinator had even heard of it).
 from __future__ import annotations
 
 import time
-import uuid
 from typing import Any
 
-from . import beckn
+from . import beckn, ids
+from . import meter_check as mc
 from . import settlement as st
 
 PRICE_RULE = {"ratio": 2.0, "min_usd_mwh": 100.0, "from": "12:00", "to": "21:00", "hours": 1, "kw_share": 0.5,
@@ -32,6 +33,7 @@ PRICE_RULE = {"ratio": 2.0, "min_usd_mwh": 100.0, "from": "12:00", "to": "21:00"
 EMERGENCY_PRICE_X = 2.0
 SETTLE_AFTER_MIN = 60          # dataset minutes after a call ends: its last readings are in
 CONFIRM_WAIT_MIN = 360         # live: a call the coordinator has not confirmed yet waits this long before it settles
+SETTLE_TRIES = 5               # a call that fails to settle this many times is left, and the rest go on
 
 
 def beckn_minutes(a: str, b: str) -> float:
@@ -85,8 +87,12 @@ class GridWatch:
         self.alerts.append(a)
         return a
 
+    def _mid(self, to: str, action: str, *key: Any) -> str:
+        return ids.sealed(getattr(self.u, "key", None), getattr(self.u, "play", ""), self.u.name, to, action, *key)
+
     def call(self, kind: str, start: str, end: str, kw: float, price: float, why: str) -> dict[str, Any]:
-        cid = f"call-{start[:10]}-{start[11:13]}{start[14:16]}-{kind}-{uuid.uuid4().hex[:4]}"
+        # who, in which play, and its own count: a buyer that restarts before it saved this call makes the same one, and another buyer or a day played again makes another
+        cid = f"call-{start[:10]}-{start[11:13]}{start[14:16]}-{kind}-{ids.digest(self.u.name, getattr(self.u, 'play', ''), len(self.calls))[:6]}"
         rec = {"id": cid, "kind": kind, "start": start, "end": end, "kw": round(kw, 3), "price_usd_per_kwh": round(price, 4),
                "why": why, "issued_at": self.u.now(), "confirmed_kw": None, "warnings": [], "readings": {},
                "status": "OPEN", "issued_wall": time.time()}
@@ -97,9 +103,20 @@ class GridWatch:
         body = beckn.make("rt_call", sender=self.u.name, receiver=to, transaction_id=cid,
                           message={"call": {k: rec[k] for k in ("id", "kind", "start", "end", "kw", "price_usd_per_kwh", "why")}},
                           key=self.u.key, sender_role="bpp")
-        self.u.town.send(to, beckn.kind("rt_call"), body, f"{self.u.name}:rt_call:{cid}")
+        self._post(to, beckn.kind("rt_call"), body, self._mid(to, "rt_call", cid))
         self.u.event("rt_call", call_id=cid, call_kind=kind, kw=rec["kw"], start=start, end=end, price=rec["price_usd_per_kwh"], why=why)
         return rec
+
+    def _post(self, to: str, kind: str, body: dict[str, Any], mid: str) -> None:
+        """The buyer has counted this call already, so if Town is away it goes on a later tick (utility.tick), under the same id."""
+        try:
+            out = self.u.town.send(to, kind, body, mid)
+        except Exception as exc:                            # noqa: BLE001
+            self.u.event("send_failed", to=to, message_kind=kind, error=str(exc)[:160])
+            self.u.unsent.append((to, kind, body, mid))
+            return
+        if isinstance(out, dict) and out.get("duplicate"):  # Town refused it: see town.send
+            self.u.event("send_dropped", to=to, message_kind=kind, message_id=mid)
 
     def end_call(self, cid: str, at: str | None = None) -> dict[str, Any]:
         rec = self.calls[cid]
@@ -108,7 +125,7 @@ class GridWatch:
             rec["end"], rec["ended_early"] = at, True
             body = beckn.make("rt_end", sender=self.u.name, receiver=rec["to"], transaction_id=cid,
                               message={"end": {"id": cid, "at": at}}, key=self.u.key, sender_role="bpp")
-            self.u.town.send(rec["to"], beckn.kind("rt_end"), body, f"{self.u.name}:rt_end:{cid}")
+            self._post(rec["to"], beckn.kind("rt_end"), body, self._mid(rec["to"], "rt_end", cid))
             self.u.event("rt_end", call_id=cid, at=at)
         return rec
 
@@ -137,11 +154,15 @@ class GridWatch:
         quiet = float(self.u.cfg.get("utility_settle_quiet_s", 0.0))
         after = float(self.u.cfg.get("call_settle_after_min", SETTLE_AFTER_MIN))
         for rec in self.calls.values():
+            if rec["status"] == "COMPLETE" and rec.get("late_readings") and time.time() - rec.get("last_reading_wall", 0.0) >= quiet:
+                self._settle_safely(rec, again=True)
             ref = rec["end"]
             if after > SETTLE_AFTER_MIN:                # the quiet path: a call inside a sale gets its readings in the sale's one envelope, after the window
                 ref = max([ref] + [c["need"]["window_end"] for c in self.u.contracts.values()
                                    if c.get("need") and c["need"]["window_start"] < rec["end"] and rec["start"] < c["need"]["window_end"]])
             if rec["status"] != "OPEN" or now < beckn.add_minutes(ref, after):
+                continue
+            if rec.get("settle_errors", 0) >= SETTLE_TRIES:
                 continue
             if quiet > 0:      # live: readings (the call's and the booking's) may still be on their way through a busy
                 last = max([rec.get("last_reading_wall", 0.0), rec.get("issued_wall", 0.0)]     # Town, and the
@@ -149,7 +170,15 @@ class GridWatch:
                 unconfirmed = rec.get("confirmed_kw") is None and now < beckn.add_minutes(rec["end"], CONFIRM_WAIT_MIN)
                 if time.time() - last < quiet or unconfirmed:     # confirm may not be in yet: wait for a quiet inbox
                     continue
-            self.settle(rec)
+            self._settle_safely(rec)
+
+    def _settle_safely(self, rec: dict[str, Any], again: bool = False) -> None:
+        """One call that can't be settled doesn't stop the buyer's tick: the sale and the other calls settle behind it. It's tried a few times and then left, and it says so."""
+        try:
+            (self.settle_again if again else self.settle)(rec)
+        except Exception as exc:                            # noqa: BLE001
+            rec["settle_errors"] = rec.get("settle_errors", 0) + 1
+            self.u.event("settle_error", call_id=rec["id"], tries=rec["settle_errors"], error=str(exc)[:200])
 
     # ------------------------------------------------------------------ inbox
     def handle(self, act: str, sender: str, body: dict[str, Any]) -> str | None:
@@ -160,13 +189,19 @@ class GridWatch:
             c = m["confirm"]
             rec = self.calls.get(c.get("id"))
             if not rec:
-                return "confirm for an unknown call"
+                return beckn.Refused("confirm for an unknown call")
             rec.update({"confirmed_kw": c.get("kw"), "short_kw": c.get("short_kw"), "confirmed_homes": c.get("homes", [])})
             if c.get("refused"):                        # the desk took nothing on: nobody was asked, and nothing will be read or paid
                 rec.update({"status": "REFUSED", "refused": c["refused"]})
             self.u.event("rt_confirmed", call_id=rec["id"], kw=c.get("kw"), short_kw=c.get("short_kw"),
                          homes=len(c.get("homes", [])))
             return f"call {rec['id']}: {c.get('kw')} kW confirmed"
+        if "dispatched" in m:                           # who owes under this call: it pays only those the desk names
+            rec = self.calls.get(m["dispatched"].get("id"))
+            if not rec:
+                return beckn.Refused(f"dispatch list for an unknown call {m['dispatched'].get('id')}")
+            mc.take_list(rec, m["dispatched"].get("alloc"), self.u.event)
+            return f"dispatch list for {m['dispatched'].get('id')}"
         if "warning" in m:
             w = m["warning"]
             for rec in self.calls.values():
@@ -186,10 +221,13 @@ class GridWatch:
         if not beckn.check(body, pin) or r.get("home") != sender:
             rec["rejected"] = rec.get("rejected", 0) + 1
             self.u.event("reading_rejected", home=sender, event_id=rec["id"])
-            return "rejected: bad signature"
-        rec["readings"].setdefault(sender, {})[r["start"]] = {"usage_kw": float(r["usage_kw"]),
-                                                              "dispatched_kw": float(r.get("committed_kw", 0.0)),
-                                                              "battery_kw": float(r.get("battery_kw") or 0.0)}
+            return beckn.Refused("rejected: bad signature")
+        why = mc.call_refuses(rec, sender, r, self.u.event)
+        if why:
+            return why
+        if rec.get("status") == "COMPLETE" and r["start"] not in rec["readings"].get(sender, {}):
+            rec["late_readings"] = rec.get("late_readings", 0) + 1
+        mc.keep_call_row(rec, sender, r)
         rec["last_reading_wall"] = time.time()
         return f"call reading {sender} {r['start'][11:]}"
 
@@ -202,22 +240,16 @@ class GridWatch:
         for ct in self.u.contracts.values():
             if ct.get("status") not in ("ACTIVE", "COMPLETE") or not ct.get("baselines"):
                 continue
-            bases = self.u.settlement_baselines(ct)
+            view = mc.counted(ct, self.u.settlement_baselines(ct))[0]      # the booking's own measure: same-day adjustment, a closed building's fall left out, the limits
             for s in ct["need"]["slots"]:
                 if s["start"] not in slots:
                     continue
                 sid = int(s["id"])
                 offered[s["start"]] = offered.get(s["start"], 0.0) + float((ct.get("pool_offered") or ct.get("offered") or {}).get(sid, 0.0))
                 for m in ct.get("meters", []):
-                    if sid in (ct.get("abnormal") or {}).get(m, ()):      # a closed building's fall isn't a cut, here as in the booking
-                        continue
-                    use = ct.get("meter_readings", {}).get(m, {}).get(sid)
-                    base = bases.get(m, {}).get(str(sid), {}).get("BASELINE")
-                    if base is not None and st.MARKET:    # the booking's own measure, with the same-day adjustment
-                        base = st.adjusted(base, ct.get("meter_pre", {}).get(m), ct.get("pre_baselines", {}).get(m))
-                    if use is not None and base is not None:
-                        booked = float(ct.get("meter_committed", {}).get(m, {}).get(sid, 0.0))
-                        per.setdefault(s["start"], {})[m] = (float(base), float(use), booked)
+                    row = view.get(m, {}).get(sid)
+                    if row is not None:
+                        per.setdefault(s["start"], {})[m] = (float(row["BASELINE"]), float(row["USAGE"]), mc.committed(ct, m, sid))
         return offered, per
 
     def settle(self, rec: dict[str, Any]) -> dict[str, Any]:
@@ -243,7 +275,7 @@ class GridWatch:
             def meas(h, b, u, bk):
                 v = st.clamp0(b - u)
                 if (fleet.get(h) or {}).get("kind") != "building":
-                    return v
+                    return mc.at_most_nameplate(h, v)
                 disp = ((rec["readings"].get(h) or {}).get(s) or {}).get("dispatched_kw", 0.0)
                 return min(v, st.BUILDING_CAP_X * (bk + float(disp or 0.0)))
             measured = sum(meas(h, b, u, bk) for h, (b, u, bk) in meters.items())
@@ -263,23 +295,38 @@ class GridWatch:
             rows.append({"start": s, "measured_kw": round(measured, 3), "booked_kw": round(booked, 3),
                          "extra_kw": round(extra, 3), "share_of_half_hour": round(frac, 3), "meters": len(meters)})
         paid = round(total * rec["price_usd_per_kwh"], 4)
-        rec.update({"status": "COMPLETE", "paid_usd": paid, "delivered_kwh": round(total, 3), "rows": rows,
-                    "by_home": {h: round(v, 4) for h, v in by_home.items()},
-                    "by_home_batt": {h: round(v, 4) for h, v in by_batt.items()}})
+        by_home, by_batt = {h: round(v, 4) for h, v in by_home.items()}, {h: round(v, 4) for h, v in by_batt.items()}
+        if st.MARKET and getattr(self.u, "CLASS_RATES", False):
+            rec["full_price_usd"] = paid
+            paid = st.call_bill(paid, by_home, by_batt, {h for h in by_home if (fleet.get(h) or {}).get("kind") == "building"})
+        rec.update({"status": "COMPLETE", "paid_usd": paid, "delivered_kwh": round(total, 3), "rows": rows, "by_home": by_home, "by_home_batt": by_batt})
         self.u.event("rt_settled", call_id=rec["id"], paid_usd=paid, delivered_kwh=round(total, 3), homes=len(by_home))
         self._tell_coordinator(rec)
         return rec
 
+    def settle_again(self, rec: dict[str, Any]) -> None:
+        """Readings came in after this call was settled, its own or the booking's it's measured against: the sellers are owed what they add."""
+        rec["late_readings"], rec["top_up"] = 0, rec.get("top_up", 0) + 1
+        self.settle(rec)
+
+    def settle_again_for(self, ct: dict[str, Any]) -> None:
+        """The booking settled, after this call or again: a call inside its window is measured against those readings."""
+        n = ct["need"]
+        for rec in self.calls.values():
+            if rec["status"] == "COMPLETE" and rec["start"] < n["window_end"] and n["window_start"] < rec["end"]:
+                self._settle_safely(rec, again=True)
+
     def _tell_coordinator(self, rec: dict[str, Any]) -> None:
         to = rec.get("to") or sorted(self.u.aggregators)[0]
-        msg = {"settlement": {"call_id": rec["id"], "kind": rec["kind"], "price_usd_per_kwh": rec["price_usd_per_kwh"],
-                              "paid_usd": rec["paid_usd"], "delivered_kwh": rec["delivered_kwh"],
+        msg = {"settlement": {"call_id": rec["id"], "kind": rec["kind"], "price_usd_per_kwh": rec["price_usd_per_kwh"], **({"top_up": rec["top_up"]} if rec.get("top_up") else {}),
+                              "paid_usd": rec["paid_usd"], **({"full_price_usd": rec["full_price_usd"]} if "full_price_usd" in rec else {}),
+                              "delivered_kwh": rec["delivered_kwh"], "read": {h: sorted(d) for h, d in rec["readings"].items()},
                               "by_home_kwh": rec["by_home"], "by_home_batt_kwh": rec.get("by_home_batt", {}),
                               "rows": rec.get("rows", []), "currency": "USD"}}
         self.u.reply(to, "on_status", rec["id"], msg)
 
     def summary(self) -> list[dict[str, Any]]:
         keys = ("id", "kind", "start", "end", "kw", "price_usd_per_kwh", "why", "issued_at", "confirmed_kw", "short_kw",
-                "status", "paid_usd", "delivered_kwh", "ended_early")
+                "status", "paid_usd", "full_price_usd", "delivered_kwh", "ended_early", "rejected", "settle_errors")
         return [{**{k: r.get(k) for k in keys}, "warnings": len(r["warnings"]),
                  "homes_reading": len(r["readings"])} for r in self.calls.values()]

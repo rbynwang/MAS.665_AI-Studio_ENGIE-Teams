@@ -50,9 +50,10 @@ try:            # at module level: the routes' annotations are strings (postpone
 except ImportError:                 # pragma: no cover (the coordinator itself always has FastAPI)
     Request = Any
 
-from . import beckn, config, signing
+from . import beckn, config, doors, keep, signing
 from .market import Market
 from .replay import Replay
+from . import meter_check
 from .town import InboxPoller, LagMeter, TownSession
 
 log = logging.getLogger("flexgrid-coordinator")
@@ -72,8 +73,10 @@ class Coordinator:
         tok = config.secret("town_token")
         self.town = TownSession(self.cfg["town_url"], self.cfg["town_run_id"], self.name, tok) \
             if self.cfg.get("town_run_id") and tok else None
+        self.damaged: list[tuple[str, str]] = []          # files read here that couldn't be used: keep.for_coordinator makes each one an alarm
         self.pins_path = config.state_dir() / "home_pins.json"
-        self.pins: dict[str, str] = json.loads(self.pins_path.read_text()) if self.pins_path.exists() else {}
+        self.pins: dict[str, str] = self.read_pins()
+        self.keeper = None                                # keep.for_coordinator: live only
         self.latest: dict[str, dict[str, Any]] = {}       # home -> {"env", "at"}
         self.last_sent: dict[str, str] = {}               # home -> "YYYY-MM-DD HH" of its last dispatch
         self.slot_starts: dict[str, str] = {}             # sim slot -> home that got a new dispatch in it
@@ -85,11 +88,7 @@ class Coordinator:
         self.lag = LagMeter(window=float(self.cfg.get("town_lag_window_s", 20.0)))   # how far behind the inbox is
         self.started_wall = time.time()
         self.lock = threading.RLock()
-        self.db = sqlite3.connect(str(config.state_dir() / "ledger.db"), check_same_thread=False)
-        self.db.execute("CREATE TABLE IF NOT EXISTS receipts (n INTEGER PRIMARY KEY AUTOINCREMENT, home TEXT, "
-                        "dispatch_id TEXT, status TEXT, reason TEXT, requested REAL, applied REAL, hash TEXT, "
-                        "prev_hash TEXT, chain TEXT, body TEXT, at REAL)")
-        self.db.commit()
+        self.db = self.open_ledger(config.state_dir() / "ledger.db")
         # v2 market: one Beckn contract per grid event (see market.py)
         c = self.cfg
         roster = c.get("v2_roster") or [h["name"] for h in
@@ -98,10 +97,12 @@ class Coordinator:
         roster = roster + [b["name"] for b in building.enabled(c) if b["name"] not in roster]   # asked like a home
         self.clock = Replay(c.get("clock_profile", "tesla_calhoun"), c["replay_start"], c["replay_step_seconds"],
                             c["replay_loop_days"])
-        self.market = Market(self.name, self.key, self._town_send, self.clock, roster, self.pins,
-                             lambda: self.pins_path.write_text(json.dumps(self.pins, indent=1)), self.event, c)
+        self.market = Market(self.name, self.key, self._town_send, self.clock, roster, self.pins, self.save_pins, self.event, c)
         self.market.on_clear, self.market.on_settle = self.c3, self.c4
         self.market.town_lag = self.town_lag              # the real-time desk waits longer for answers when Town is behind
+        if self.market.pooled:                            # what each member may claim comes from its enrolment, not its word: an offer's limit, and a live run's too
+            self.market.rated = meter_check.rated(roster)
+            self.event("v2_nameplates", members=len(roster), on_file=len(self.market.rated))
         from .monitor import LiveRecorder               # the Control Room's record of the current event
         self.monitor = LiveRecorder(self.market, c, self.event, lambda: list(self.events))
         # the Mac's AI agents (llm_enabled): the coordinator's own (it picks each event's margin; brain.py) and the grid
@@ -109,16 +110,58 @@ class Coordinator:
         # local LLM through the Mac's OpenClaw gateway (agents "coordinator" and "buyer"), Ollama straight as stand-in
         self.brain = self.buyer = None
         if c.get("llm_enabled"):
-            from .brain import CoordinatorBrain, make_backend
-            self.brain = CoordinatorBrain(make_backend({**c, "openclaw_agent": "coordinator"}, "coordinator"),
-                                          log=self.event, budget_s=float(c.get("llm_margin_budget_s", 40)),
-                                          default_margin=float(c.get("clear_margin", 0.10)))
+            from .brain import make_backend
+            from .coord_agent import for_market
+            self.brain = for_market(make_backend({**c, "openclaw_agent": "coordinator"}, "coordinator"), self.market.pooled,
+                                    log=self.event, budget_s=float(c.get("llm_margin_budget_s", 40)), default_margin=float(c.get("clear_margin", 0.10)))
             self.market.brain = self.monitor.coord_brain = self.brain
             if c.get("buyer_agent", True):
                 from .buyer_agent import BuyerAgent
                 self.buyer = BuyerAgent(c, self.event, self.monitor.src["utility"])
                 self.monitor.buyer = self.buyer
         self.buyer_signed: set[str] = set()               # events whose sign-off the buyer agent has been asked for
+
+    def read_pins(self) -> dict[str, str]:
+        """A file that can't be read costs the pins, not the start. It's set aside and it's an alarm, because until each node speaks again it's pinned to whoever speaks first."""
+        try:
+            pins = json.loads(self.pins_path.read_text()) if self.pins_path.exists() else {}
+            if not isinstance(pins, dict) or not all(isinstance(v, str) for v in pins.values()):
+                raise ValueError("it isn't a table of keys")
+            return pins
+        except (OSError, ValueError, RecursionError) as exc:
+            self.damaged.append(("home_pins", f"{type(exc).__name__}: {str(exc)[:120]}"))
+            keep.set_aside(self.pins_path)
+            return {}
+
+    def open_ledger(self, path: Any) -> sqlite3.Connection:
+        """The record of the old path's receipts. A file that isn't a database costs that record, not the start. If it can't even be moved, the ledger lasts as long as the process."""
+        def opened(where: str) -> sqlite3.Connection:
+            db = sqlite3.connect(where, check_same_thread=False)
+            try:
+                db.execute("CREATE TABLE IF NOT EXISTS receipts (n INTEGER PRIMARY KEY AUTOINCREMENT, home TEXT, "
+                           "dispatch_id TEXT, status TEXT, reason TEXT, requested REAL, applied REAL, hash TEXT, "
+                           "prev_hash TEXT, chain TEXT, body TEXT, at REAL)")
+                db.commit()
+                said = db.execute("PRAGMA quick_check").fetchone()[0]
+                if said != "ok":
+                    raise sqlite3.DatabaseError(str(said)[:120])
+                return db
+            except sqlite3.Error:
+                db.close()
+                raise
+        try:
+            return opened(str(path))
+        except sqlite3.Error as exc:
+            self.damaged.append(("ledger", f"{type(exc).__name__}: {str(exc)[:120]}"))
+        keep.set_aside(path)
+        try:
+            return opened(str(path))
+        except sqlite3.Error:
+            return opened(":memory:")
+
+    def save_pins(self) -> None:
+        """All or nothing: a file cut short by a crash costs every pin at the next start."""
+        keep.write_atomic(self.pins_path, json.dumps(self.pins, indent=1).encode())
 
     def _v2_flow(self, flow: str, event_id: str, phase: str, fallback) -> None:
         """Run a v2 Langflow flow for one event in the background; if it is not set up or does not get the event
@@ -132,14 +175,22 @@ class Coordinator:
             except Exception as exc:
                 self.event("v2_flow_error", flow=flow, event_id=event_id, error=str(exc)[:200])
             with self.market.lock:
-                if self.market.events[event_id]["phase"] == phase:
+                ev = self.market.events.get(event_id)
+                if ev is None or ev["phase"] != phase:
+                    return
+                try:
                     fallback(event_id)
                     self.event(f"{flow.lower()}_inprocess", event_id=event_id)
+                except Exception as exc:                  # noqa: BLE001  this thread dying says nothing, and no tick picks these phases up: the alarm reads this (keep.market_risks)
+                    ev["flow_failed"] = f"{type(exc).__name__}: {exc}"[:160]
+                    self.event("v2_flow_failed", flow=flow, event_id=event_id, error=ev["flow_failed"])
+                    log.error("%s for %s: %s", flow, event_id, traceback.format_exc())
         threading.Thread(target=run, daemon=True).start()
 
     def c3(self, event_id: str) -> None:
         """Offers are in: flow C3 Clear (Collect Offers -> Clear with Rebound Guard -> Contract with the Utility)."""
-        self.market.events[event_id]["phase"] = "clearing"
+        ev = self.market.events[event_id]
+        ev["phase"], ev["clearing_wall"] = "clearing", time.time()
         self._v2_flow("C3", event_id, "clearing", self.market.clear_and_commit)
 
     def c4(self, event_id: str) -> None:
@@ -155,16 +206,21 @@ class Coordinator:
     def _town_send(self, to: str, kind: str, body: dict[str, Any], message_id: str) -> dict[str, Any]:
         if not self.town:
             raise RuntimeError("no NANDA Town session")
-        return self.town.send(to, kind, body, message_id)
+        out = self.town.send(to, kind, body, message_id)
+        if isinstance(out, dict) and out.get("duplicate"):    # Town refused it: see town.send
+            self.event("town_send_dropped", to=to, message_kind=kind, message_id=message_id)
+        return out
 
     def market_loop(self) -> None:
         while True:
             try:
                 self.market.tick()
                 self._buyer_tick()
+                self.market.failing.pop("the tick", None)
             except Exception as exc:
                 self.event("market_error", error=str(exc)[:200])
                 log.error("market: %s", traceback.format_exc())
+                self.market.failed("the tick", exc)
             time.sleep(1.0)
 
     def _buyer_tick(self) -> None:
@@ -213,7 +269,7 @@ class Coordinator:
             first = pinned is None
             if first and signer:
                 self.pins[sender] = pinned = signer
-                self.pins_path.write_text(json.dumps(self.pins, indent=1))
+                self.save_pins()
         if not signing.verify(report, pinned or ""):
             return {"ok": False, "reason": "bad_signature", "home": sender}
         if report.get("agent") not in (None, sender):
@@ -429,10 +485,10 @@ class Coordinator:
         status, note = "processed", {}
         if str(kind).startswith("beckn.") and beckn.expired(body, default_ttl=float(self.cfg.get("max_message_age_s", 900))):
             self.expired_skipped += 1                     # waited in the inbox past its validity (e.g. while the
-            note = {"skipped": "expired", "late_s": round(beckn.expired(body) or 0)}   # coordinator was off): drop
+            status, note = "rejected", {"skipped": "expired", "late_s": round(beckn.expired(body) or 0)}   # coordinator was off): drop
         elif str(kind).startswith("beckn."):
             try:
-                note = {"result": self.market.handle(kind, sender, body)[:300]}
+                status, note = beckn.ack_of(self.market.handle(kind, sender, body), 300, "result")
             except Exception as exc:
                 status, note = "rejected", {"error": str(exc)[:200]}
                 log.error("v2: %s", traceback.format_exc())
@@ -440,13 +496,15 @@ class Coordinator:
             age = time.time() - float(body.get("published_wall", 0))
             if age > float(self.cfg["report_max_age_s"]):      # backlog from while the coordinator was off
                 self.stale_skipped += 1
-                note = {"skipped": "stale", "age_s": round(age)}
+                status, note = "rejected", {"skipped": "stale", "age_s": round(age)}
             else:
                 note = {"result": self.c1(sender, body)[:300]}
         elif kind == "flex.dispatch_ack":
             note = {"result": self.c2(sender, body)[:300]}
         else:
             status, note = "rejected", {"reason": "unknown_kind"}
+        if self.keeper is not None and sender in self.market.buyers:
+            self.keeper.save()                            # on disk before Town hears it: nobody sends a contract step, a settlement or a call twice
         self.town.ack(msg["message_id"], msg["fence"], status, note)
 
     def inbox_loop(self) -> None:
@@ -501,6 +559,16 @@ def town_hold(lag_s: float, slow_s: float, brake_s: float = TOWN_LAG_BRAKE_S,
         return slow_s, f"NANDA Town is {lag_s:.0f} s behind: 1x until its messages catch up"
     k = 2.0 if lag_s < 2 * hold_s else 4.0 if lag_s < 4 * hold_s else 8.0
     return slow_s * k, f"NANDA Town is {lag_s:.0f} s behind: the clock waits for its messages ({k:g}x slower)"
+
+
+def readings_hold(due: int, slow_s: float) -> tuple[float, str] | None:
+    """How the live clock waits for readings the sale is still owed: (seconds a step, why) or None. town_hold follows arrivals, so it lets go when they stop and when
+    a backlog drains in bursts (14 Jul: from 200 s a step back to 25 s with 340 s of backlog, into the readings deadline with 300 of 1,200 in). This follows who owes
+    what, 6 readings a node. It slows the clock and never stops it, so a node that's gone holds it only until the market's own deadline."""
+    if due <= 0:
+        return None
+    k = 2.0 if due < 12 else 4.0 if due < 60 else 8.0
+    return slow_s * k, f"{due} readings still due: the clock waits for them ({k:g}x slower)"
 
 
 def opens_brake(answered: str | None, now_ts: str, soon: str) -> bool:
@@ -604,7 +672,7 @@ def admin_restart(cfg: dict[str, Any], request: Any, event: Any, how: str) -> di
 def build_app(c: Coordinator):
     from fastapi import Body, FastAPI, HTTPException
 
-    app = FastAPI(title="flexgrid-coordinator", version="0.2.0")
+    app = FastAPI(title="flexgrid-coordinator", version="0.2.0", dependencies=[doors.door()])
     started_at, code_at_start = time.time(), code_stamp()
 
     @app.get("/health")
@@ -615,11 +683,11 @@ def build_app(c: Coordinator):
                 "town_calls": p.stats() if p else None,
                 "town_lag_s": round(c.town_lag(), 1), "inbox_lag_s": round(c.lag.value(), 1),
                 "town_ms": c.town.timing() if c.town is not None and hasattr(c.town, "timing") else None,
-                "town": bool(c.town), "transport": getattr(c.town, "label", None)
+                "town": bool(c.town), "doors": doors.state(), "transport": getattr(c.town, "label", None)
                 or (f"NANDA Town {c.cfg.get('town_url')} run {c.cfg.get('town_run_id')}" if c.town else None),
                 "expired_skipped": c.expired_skipped,
                 "pinned_homes": sorted(c.pins), "homes_reporting": sorted(c.latest), "stale_reports_skipped":
-                c.stale_skipped, "flows": c.cfg.get("flows")}
+                c.stale_skipped, "flows": c.cfg.get("flows"), **keep.health(c.keeper)}
 
     @app.post("/admin/restart")
     def admin_restart(request: Request):
@@ -695,7 +763,7 @@ def build_app(c: Coordinator):
         out = dict(cache.get())
         if c.cfg.get("monitor_datacenters", True) and out.get("day_ahead"):
             try:                                           # the data center agents plan on this same snapshot
-                r = httpx.post(c.monitor.src["datacenters"] + "/dc/today", json=out, timeout=8)
+                r = httpx.post(c.monitor.src["datacenters"] + "/dc/today", json=out, timeout=8, headers=doors.headers())
                 if r.status_code == 200:
                     out["datacenters_today"] = r.json()
             except Exception:                              # flexgrid-dc not running: the grid answer stands alone
@@ -771,10 +839,12 @@ def build_app(c: Coordinator):
     repo = Path(__file__).resolve().parents[1]
 
     def page(name: str):
+        """The page as built, with the door's few lines in its head while this machine has a token (doors.page_door): its POST buttons ask a person for it once."""
+        from fastapi.responses import HTMLResponse
         f = repo / "viz" / "live" / "dist" / name
         if not f.exists():
             raise HTTPException(404, f"{name} not built: python3 viz/live/build.py")
-        return FileResponse(f, media_type="text/html", headers={"Cache-Control": "no-store"})
+        return HTMLResponse(doors.page_door(f.read_text(encoding="utf-8")), headers={"Cache-Control": "no-store"})
 
     @app.get("/monitor")
     def monitor_page():
@@ -863,7 +933,7 @@ def build_app(c: Coordinator):
             return {**_no_agent(home), "reply": None, "error": "no AI agent in this home"}
         try:
             r = httpx.post(url + "/agent/chat", json={"message": str(body.get("message") or "")[:1000]},
-                           timeout=float(c.cfg.get("llm_chat_budget_s", 120)) + 15)
+                           timeout=float(c.cfg.get("llm_chat_budget_s", 120)) + 15, headers=doors.headers())
             if r.status_code != 200:
                 return {"reply": None, "error": f"its Jetson answered {r.status_code}: {r.text[:160]}"}
             return r.json()
@@ -875,7 +945,7 @@ def build_app(c: Coordinator):
         url = _home_url(home)
         if not url:
             raise HTTPException(404, "no AI agent in this home")
-        r = httpx.post(url + "/agent/wishes", json=body or {}, timeout=8)
+        r = httpx.post(url + "/agent/wishes", json=body or {}, timeout=8, headers=doors.headers())
         if r.status_code != 200:
             raise HTTPException(r.status_code, r.text[:200])
         return r.json()
@@ -898,6 +968,10 @@ def build_app(c: Coordinator):
             raise HTTPException(503, f"the coordinator is still clearing old messages from its NANDA Town inbox "
                                      f"({c.stale_skipped + c.expired_skipped} so far); the event starts once it "
                                      f"has caught up - try again in a minute")
+        busy = [] if body.get("force") else _first_pass()
+        if busy:                               # before anything is reset or moved: on 7 Nov two starts reset the buyers and the buildings, lost the fleet, and stopped there
+            raise HTTPException(503, f"{', '.join(busy)} still on the first pass over their nodes since a restart, and a reset now would time out. Nothing was changed: "
+                                     f"try again in a minute")
         day = body.get("event", config.dataset_meta().get("default_event", "2023-08-24"))
         step = float(body.get("step_seconds", 10))
         try:
@@ -924,11 +998,11 @@ def build_app(c: Coordinator):
             not isinstance(body.get("dc_order"), dict)
         if op_orders:
             lead += float(c.cfg.get("operator_order_lead_s", 30))
-        clock = {"start": at, "at": at, "at_wall": time.time() + lead, "step_seconds": step, "loop_days": 0}
+        clock = {"start": at, "at": at, "at_wall": time.time() + lead, "step_seconds": step, "loop_days": 0, **({"hold": True} if c.cfg.get("clock_waits") else {})}
         _pace.update(gen=_pace["gen"] + 1, slow=step, day=day, why=None, brake=False, changes=deque(maxlen=40),
                      start_wall=clock["at_wall"], **_pace_choice(body.get("pace")))
         out = {}
-        with httpx.Client(timeout=20) as http:
+        with httpx.Client(timeout=20, headers=doors.headers()) as http:
             for name, base in targets.items():
                 try:
                     http.post(base + "/demo/reset", json={"clear_orders": True} if name == "utility" and buyer_orders
@@ -941,10 +1015,9 @@ def build_app(c: Coordinator):
                     out[name] = f"not reached: {str(exc)[:80]}"
         c.market.reset()
         c.buyer_signed.clear()
-        if body.get("reset_reputation"):
-            c.market.reputation.clear()
         r = c.clock
-        r.configure(clock["start"], step, 0, clock["at"], clock["at_wall"])
+        r.configure(clock["start"], step, 0, clock["at"], clock["at_wall"], hold=bool(clock.get("hold")))
+        _cond.update(since=clock["at_wall"], waits=None, changed=0.0, went_on=deque(maxlen=200), steps=0, held_s=0.0, at_gate=None, unreached=set())   # gates stay: a runner sets them first
         c.monitor.reset()
         c.what_if = {}
         out["coordinator"] = r.ts(r.current())
@@ -953,7 +1026,7 @@ def build_app(c: Coordinator):
         order = body.get("order") if isinstance(body.get("order"), dict) else None
         if order:
             try:
-                with httpx.Client(timeout=20) as http:
+                with httpx.Client(timeout=20, headers=doors.headers()) as http:
                     nd = http.get(targets["utility"] + "/needs").json()
                     need = next((x for x in nd.get("needs") or [] if x["window"][0][:10] == day), None)
                     w0, w1 = (need["window"] if need else [f"{day} 17:00", f"{day} 20:00"])
@@ -970,7 +1043,7 @@ def build_app(c: Coordinator):
         dc_order = body.get("dc_order") if isinstance(body.get("dc_order"), dict) else None
         if dc_order and "datacenters" in targets:     # the presenter's request for the data centers (MW)
             try:
-                with httpx.Client(timeout=10) as http:
+                with httpx.Client(timeout=10, headers=doors.headers()) as http:
                     rr = http.post(targets["datacenters"] + "/dc/needs", json={"day": day, "mw": float(dc_order.get("mw") or 40)})
                 out["dc_order"] = rr.json() if rr.status_code == 200 else f"refused: {rr.text[:160]}"
             except Exception as exc:           # noqa: BLE001
@@ -984,7 +1057,7 @@ def build_app(c: Coordinator):
                 out["scenario"] = f"not set: {str(exc)[:120]}"
         if op_orders:                          # first: one short decision, then the model is the buyer's
             try:
-                with httpx.Client(timeout=10) as http:
+                with httpx.Client(timeout=10, headers=doors.headers()) as http:
                     rr = http.post(targets["datacenters"] + "/dc/operator/order",
                                    json={"day": day, "budget_s": max(10.0, lead + step - 4)})
                 out["operator_agent"] = rr.json() if rr.status_code == 200 else f"refused: {rr.text[:160]}"
@@ -992,7 +1065,7 @@ def build_app(c: Coordinator):
                 out["operator_agent"] = f"not reached: {str(exc)[:120]}"
         if buyer_orders:                       # in the background: the order lands before 10:00 or the catalog's stands
             try:
-                with httpx.Client(timeout=10) as http:
+                with httpx.Client(timeout=10, headers=doors.headers()) as http:
                     nd = http.get(targets["utility"] + "/needs").json()
                 cat = next((x for x in nd.get("needs") or [] if x["window"][0][:10] == day), None)
             except Exception:                  # noqa: BLE001
@@ -1016,6 +1089,23 @@ def build_app(c: Coordinator):
         return {"event": day, "starts_at": at, "step_seconds": step, "wall_start": clock["at_wall"],
                 "minutes_total": round((96 + 57) * step / 60, 1), "agents": out, "pace": _pace_view()}
 
+    def _first_pass() -> list[str]:
+        """The node services still on their first pass since they started: /health says ready: false, or is too busy to say in 6 s, which a reset wouldn't get past either. One that
+        doesn't answer at all is "not reached" below, as before. The reads go at once, so this takes 6 s at most whatever the links do: live_bench's own call to here waits 30."""
+        from concurrent.futures import ThreadPoolExecutor
+        targets = _clock_targets()
+        names = [n for n in ("fleet", *c.monitor.bnames) if n in targets]
+
+        def busy(name: str) -> bool:
+            try:
+                return httpx.get(targets[name] + "/health", timeout=6).json().get("ready") is False
+            except httpx.TimeoutException:
+                return True
+            except (httpx.HTTPError, ValueError, AttributeError):
+                return False
+        with ThreadPoolExecutor(max_workers=max(1, len(names))) as pool:
+            return [n for n, b in zip(names, pool.map(busy, names)) if b]
+
     def _clock_targets() -> dict[str, str]:
         """Every agent that keeps the replay clock, besides the coordinator: the utility, the fleet, both Jetson homes,
         the building nodes (cfg "buildings") and flexgrid-dc with the data centers (when the dataset has them: Illinois
@@ -1028,6 +1118,7 @@ def build_app(c: Coordinator):
             t.pop("datacenters")
         for b in c.monitor.bnames:                        # the building nodes (their own daemons, building.py)
             t[b] = c.monitor.src[b]
+        t.update(c.cfg.get("clock_extra_targets") or {})   # a clock the coordinator doesn't know by itself: the second buyer, a node in a process of its own
         return t
 
     # ---- What if (the Control Room): change the homes' weather, take a Jetson offline, trip batteries - live
@@ -1165,7 +1256,7 @@ def build_app(c: Coordinator):
         dc_url = _clock_targets().get("datacenters")
         if (dcb.get("operator") or dcb.get("sites") or dcb.get("urgent_job")) and not dc_url:
             sent["datacenters"] = {"error": "no data centers in this dataset"}
-        with httpx.Client(timeout=15) as http:
+        with httpx.Client(timeout=15, headers=doors.headers()) as http:
             for name, payload in calls:
                 try:
                     r = http.post(src[name] + "/demo/scenario", json=payload)
@@ -1251,6 +1342,7 @@ def build_app(c: Coordinator):
     PACE_MIN_S = float(c.cfg.get("pace_min_seconds", 1.0))
     _pace: dict[str, Any] = {"x": 1.0, "auto": False, "slow": None, "day": None, "why": None, "gen": 0,
                              "pending": False, "loop": False, "changes": deque(maxlen=40)}
+    c.pace = _pace                                        # keep.py saves the run's part of it
     _T_RE = re.compile(r'^\{"t":([0-9.]+)')
 
     def _pace_choice(p: Any) -> dict[str, Any]:
@@ -1394,7 +1486,9 @@ def build_app(c: Coordinator):
         """(seconds per step wanted now, why the brake holds 1x or None, what Auto is doing)."""
         S = float(_pace.get("slow") or c.clock.step_seconds)
         hold = town_hold(c.town_lag(), S) if c.cfg.get("pace_town_hold", True) else None
-        if hold:                          # NANDA Town is behind: the clock waits for the messages, whatever else
+        due = readings_hold(c.market.readings_due(), S) if c.cfg.get("pace_town_hold", True) else None
+        hold = max(hold, due, key=lambda x: x[0]) if hold and due else hold or due
+        if hold:                          # NANDA Town is behind, or readings are still due: the clock waits for the messages, whatever else
             return hold[0], hold[1], None
         day = _pace.get("day")
         if day and c.clock.ts(c.clock.current()) >= beckn.add_minutes(f"{day} 23:45", 15):
@@ -1437,7 +1531,7 @@ def build_app(c: Coordinator):
 
         def post(name: str, base: str) -> None:
             try:
-                rr = httpx.post(base + "/demo/clock", json=body, timeout=3)
+                rr = httpx.post(base + "/demo/clock", json=body, timeout=3, headers=doors.headers())
                 rr.raise_for_status()
                 res[name] = rr.json().get("now", "ok")
             except Exception as exc:
@@ -1452,6 +1546,8 @@ def build_app(c: Coordinator):
         c.event("pace", step_seconds=new, was=old, sim=plan["at"], why=why, agents=res)
 
     def _pace_tick() -> None:
+        if c.cfg.get("clock_waits"):                      # the clock waits for the agents: the conductor sets each step, and no pace applies
+            return _conductor_tick()
         if _pace["pending"] or not _pace.get("slow") or c.clock.at_wall is None \
                 or time.time() < float(_pace.get("start_wall") or 0) + 0.5:      # the run has not started yet
             return
@@ -1472,10 +1568,172 @@ def build_app(c: Coordinator):
                 _pace["pending"] = False
         threading.Thread(target=run, daemon=True).start()
 
+    def _clock_again() -> None:
+        """An agent that restarted came back on the line it saved. If the pace changed while it was away, nothing tells it again, and it plays on at the old speed. Any
+        agent on another line gets this one, and goes on with its state (keep). An agent that doesn't answer is left for the next round: _retime reports those."""
+        r = c.clock
+        wall0, step, i0, loop, held = r._line
+        if r.at_wall is None or loop or _pace["pending"] or _cond.get("posting"):
+            return
+        at = r.ts(i0)
+        for name, base in _clock_targets().items():
+            try:
+                got = httpx.get(base + "/demo/clock", timeout=3).json()
+                if abs(float(got["at_wall"] or 0.0) - wall0) > 0.5 or abs(float(got["step_seconds"]) - step) > 1e-6 or bool(got.get("held")) != (held is not None) \
+                        or (held is not None and got.get("now") != at):
+                    httpx.post(base + "/demo/clock", timeout=3, headers=doors.headers(), json={"start": at, "at": at, "at_wall": wall0, "step_seconds": step, "loop_days": 0, "keep": True,
+                                                                                              **({"hold": True} if held is not None else {})}).raise_for_status()
+                    c.event("clock_sent_again", agent=name, was=got.get("now"), now=r.ts(r.current()))
+            except (httpx.HTTPError, KeyError, TypeError, ValueError):
+                continue
+
+    # ---- The clock waits for the agents (cfg clock_waits; agentic/DESIGN.md section 3). Every clock holds at a step until every node service has ticked it
+    # and no agent there is still deciding, and until nothing the market waits on is still coming: offers, a contract, commitments, a call's answers, readings,
+    # settlement. Then all of them move one step together. Waits that don't move for clock_wait_idle_s let the clock go on, and that is on the record.
+    _cond: dict[str, Any] = {"since": 0.0, "waits": None, "changed": 0.0, "went_on": deque(maxlen=200), "steps": 0, "held_s": 0.0, "posting": False,
+                             "gates": set(), "at_gate": None, "unreached": set()}
+    c.cond = _cond
+
+    def _agent_services() -> list[str]:
+        """The node services' base URLs, where /agents says who is still deciding: cfg clock_wait_urls, or the fleet's and the buildings' own."""
+        urls = list(c.cfg.get("clock_wait_urls") or [])
+        if not urls:
+            src = c.monitor.src
+            if src.get("fleet"):
+                urls.append(src["fleet"])
+            for b in c.monitor.bnames:
+                base = str(src.get(b) or "").split("/b/")[0]
+                if base and base not in urls:
+                    urls.append(base)
+        return urls
+
+    def _market_waits(now_ts: str) -> list[str]:
+        """What the market waits on now that only an answer can bring: sim time doesn't pass while the clock holds."""
+        out = []
+        with c.market.lock:
+            members = len(c.market.roster)
+            for e in c.market.events.values():
+                n, ph = e["need"], e.get("phase")
+                eid = n["event_id"]
+                if ph == "offers" and len(e.get("offers") or {}) < members:
+                    out.append(f"{eid}: {members - len(e.get('offers') or {})} offers to come")
+                elif ph in ("clearing", "cleared", "utility"):
+                    out.append(f"{eid}: the buyers' contract")
+                elif ph == "homes" and not e.get("final_sent"):
+                    left = sum(1 for x in (e.get("commitments") or {}).values() if x.get("status") == "SENT")
+                    if left:
+                        out.append(f"{eid}: {left} commitments to answer")
+                if e.get("telemetry_sent") and ph not in ("done", "failed") and now_ts < beckn.add_minutes(n["window_end"], 1440):
+                    out.append(f"{eid}: the buyers' settlement")
+            for r in c.market.rt.calls.values():
+                if r.get("phase") == "asking":
+                    out.append(f'call {r.get("id")}: answers to come')
+        due = c.market.readings_due()
+        if due:
+            out.append(f"{due} readings to come")
+        if opens_brake(c.market.last_discover_day, now_ts, now_ts):
+            out.append("the buyer's request for tomorrow")
+        return out
+
+    def _node_waits(now_ts: str) -> list[str]:
+        out = []
+        for base in _agent_services():
+            try:
+                cl = (httpx.get(base + "/agents", timeout=3).json() or {}).get("clock") or {}
+            except (httpx.HTTPError, ValueError):
+                out.append(f"{base}: no answer")
+                continue
+            if cl.get("ticked") != now_ts:
+                out.append(f'{base}: its nodes at {cl.get("ticked")}')
+            if cl.get("busy"):
+                out.append(f'{base}: {len(cl["busy"])} deciding ({", ".join(cl["busy"][:4])})')
+        return out
+
+    def _hold_all(j: int) -> None:
+        """Every clock to step j, held there."""
+        r = c.clock
+        at = r.ts(j)
+        body = {"start": at, "at": at, "at_wall": time.time(), "step_seconds": float(r.step_seconds), "loop_days": 0, "keep": True, "hold": True}
+        res: dict[str, Any] = {}
+
+        def post(name: str, base: str) -> None:
+            try:
+                httpx.post(base + "/demo/clock", json=body, timeout=5, headers=doors.headers()).raise_for_status()
+            except Exception as exc:                      # noqa: BLE001  it gets the line again from _clock_again
+                res[name] = f"not reached: {str(exc)[:80]}"
+        _cond["posting"] = True
+        try:
+            ths = [threading.Thread(target=post, args=kv, daemon=True) for kv in _clock_targets().items()]
+            for t in ths:
+                t.start()
+            r.configure(at, float(r.step_seconds), 0, at, body["at_wall"], hold=True)
+            for t in ths:
+                t.join(6)
+        finally:
+            _cond["posting"] = False
+        if set(res) != _cond["unreached"]:               # once when it changes, not at every step
+            c.event("clock_not_reached", sim=at, agents=res)
+        _cond["unreached"] = set(res)
+
+    def _conductor_tick() -> None:
+        r = c.clock
+        if r.at_wall is None or r.loop_days or not r.held or time.time() < _cond["since"]:
+            return
+        if time.time() < _cond["since"] + float(r.step_seconds):      # the run's pace: a step lasts at least this long
+            return
+        i = r.current()
+        if i >= len(r.rows) - 1:
+            return
+        now_ts = r.ts(i)
+        waits = _node_waits(now_ts) + _market_waits(now_ts)
+        t = time.time()
+        if waits:
+            sig = tuple(waits)
+            if sig != _cond["waits"]:
+                _cond["waits"], _cond["changed"] = sig, t
+            if t - _cond["changed"] < float(c.cfg.get("clock_wait_idle_s", 180)):
+                return
+            _cond["went_on"].append({"sim": now_ts, "wall": round(t, 1), "without": list(waits)[:8]})
+            c.event("clock_went_on", sim=now_ts, waited_s=round(t - _cond["since"], 1), without=list(waits)[:8])
+        nxt = r.ts(i + 1)
+        if nxt in _cond["gates"]:                         # a test runner posts what happens at nxt before any node sees it, then opens the gate
+            _cond["at_gate"] = nxt
+            return
+        _cond["held_s"] += max(0.0, t - _cond["since"] - float(r.step_seconds))
+        _cond["steps"] += 1
+        _hold_all(i + 1)
+        _cond.update(since=time.time(), waits=None, changed=0.0)
+
+    @app.get("/demo/conductor")
+    def conductor_get():
+        """The waiting clock: steps moved, seconds held beyond the pace, and every time it went on without something."""
+        return {"on": bool(c.cfg.get("clock_waits")), "now": c.clock.ts(c.clock.current()), "held": c.clock.held, "steps": _cond["steps"],
+                "held_s": round(_cond["held_s"], 1), "waiting_on": list(_cond["waits"] or ()), "went_on": list(_cond["went_on"]),
+                "gates": sorted(_cond["gates"]), "at_gate": _cond["at_gate"]}
+
+    @app.post("/demo/conductor")
+    def conductor_post(body: dict = Body(default={})):
+        """Gates, for a test runner: {"gates": [ts, ...]} are the steps the clock stops before, held one step earlier with everything else done, until
+        {"open": ts}. So a what-if lands on its own step, as in the offline day, whatever the runner's own timing."""
+        if isinstance(body.get("gates"), list):
+            _cond["gates"] = {str(x) for x in body["gates"]}
+            _cond["at_gate"] = None
+        if body.get("open"):
+            _cond["gates"].discard(str(body["open"]))
+            if _cond["at_gate"] == str(body["open"]):
+                _cond["at_gate"] = None
+        return conductor_get()
+
     def _pace_start() -> None:
         if _pace["loop"]:
             return
         _pace["loop"] = True
+
+        def again() -> None:
+            while True:
+                time.sleep(20.0)
+                _clock_again()
+        threading.Thread(target=again, daemon=True, name="clock-again").start()
 
         def loop() -> None:
             while True:
@@ -1642,17 +1900,18 @@ def build_app(c: Coordinator):
     def demo_reset(body: dict = Body(default={})):
         c.market.reset()
         c.monitor.reset()
-        if body.get("reputation"):
-            c.market.reputation.clear()
         return {"ok": True}
 
     @app.post("/demo/clock")
     def demo_clock(body: dict = Body(default={})):
         r = c.clock
         r.configure(body.get("start", r.start), float(body.get("step_seconds", r.step_seconds)),
-                    int(body.get("loop_days", r.loop_days)), body.get("at"), body.get("at_wall"))
+                    int(body.get("loop_days", r.loop_days)), body.get("at"), body.get("at_wall"), hold=bool(body.get("hold")))
         return r.clock()
 
+    if getattr(c, "pace_saved", None):                    # the clock came back with its run, so the brake on it must too
+        _pace.update(c.pace_saved, gen=_pace["gen"] + 1)
+        _pace_start()
     return app
 
 
@@ -1674,7 +1933,7 @@ def main() -> None:
         return
     if a.cmd == "send":
         try:                                    # use the running daemon's Town session (joining twice kicks it)
-            r = httpx.post(f"http://127.0.0.1:{port}/dispatch/manual", timeout=30,
+            r = httpx.post(f"http://127.0.0.1:{port}/dispatch/manual", timeout=30, headers=doors.headers(),
                            json={"to": a.to, "delta_kw": a.delta, "minutes": a.minutes, "reason": a.reason})
             r.raise_for_status()
             d = r.json()
@@ -1686,12 +1945,14 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
     logging.getLogger("httpx").setLevel(logging.WARNING)      # one line per Town poll is noise
     c = Coordinator()
+    c.cfg.setdefault("readings_quiet_s", 30.0)            # live: readings still on their way through a busy Town aren't asked for twice. The market holds this dict
     _logs = __import__("pathlib").Path(__file__).resolve().parents[1] / "logs"
     _logs.mkdir(exist_ok=True)
     from . import wire
     wire.open_log(str(_logs / "town_wire.jsonl"))         # every Beckn message sent or received (tools/live_talk.py)
     print(f"coordinator {c.name} pubkey {c.pub}; Town run {c.cfg.get('town_run_id')}; API http://127.0.0.1:{port}",
           flush=True)
+    keeper = keep.for_coordinator(c)                      # a sale that was running carries on, before the inbox and the tick start
     if c.town:                                   # joins in the background (again and again while Town is down), then
         c.town.join_until_up(then=lambda: threading.Thread(target=c.inbox_loop, daemon=True).start(),   # reads its
                              log=lambda m: (print(m, flush=True), c.event("town_error", error=m)))      # inbox
@@ -1704,7 +1965,10 @@ def main() -> None:
     logs.mkdir(exist_ok=True)
     threading.Thread(target=c.monitor.loop, args=(str(logs / "monitor_state.json"),), daemon=True).start()
     print(f"Control Room: http://127.0.0.1:{port}/monitor   household app: http://127.0.0.1:{port}/phone", flush=True)
-    uvicorn.run(build_app(c), host="127.0.0.1", port=port, log_level="warning")
+    try:
+        uvicorn.run(build_app(c), host="127.0.0.1", port=port, log_level="warning")
+    finally:
+        keeper.close()
 
 
 if __name__ == "__main__":

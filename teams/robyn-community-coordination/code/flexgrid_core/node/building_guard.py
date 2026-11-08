@@ -3,7 +3,8 @@
   1 safety state   2 allowed   3 range   4 timing   5 service   6 one writer per point
 
 It reads only `f`, the facts the step gives it, so it runs the same on the simulated building and on a real one. tests/test_node_building_cards.py
-walks every example and test on the building cards through it.
+walks every example and test on the building cards through it. A reading that isn't in the facts stops the call: d["humid"] raises, and check() answers that it's
+missing. `.get` with a default is only for what a target may simply not have, like a booking. building_see.NO_SENSOR lists what the simulation can't read.
 
 Rulings it follows (SPEC section 11): one writer per point, not per device. A writer may end or shorten its own call, and calls that don't overlap may be
 queued. Count kW once: where a plant tool covers a window, zone calls show 0 kW, except rooftop and tenant units.
@@ -16,7 +17,7 @@ from datetime import date
 from typing import Any
 
 from . import owner
-from .guard import Guard, answer, blocked, num
+from .guard import STOPPED, Guard, answer, blocked, num, off_list
 
 VOLTS = 240.0
 OPEN_C, EMPTY_C = 1.5, 3.0       # warmer than normal: while people may be in, and in empty zones
@@ -92,7 +93,7 @@ def zone_kw(d: dict[str, Any], offset_c: float) -> float:
     free = float(d.get("free_share", 1.0 if d.get("state") == "free" else 0.0))
     args = (d.get("pre_c", 0.0), d["cap"], d["cool_kw"], d.get("hours", 3.0))
     s_free = held_share(offset_c, *args)
-    s_open = held_share(min(offset_c, OPEN_C), *args)
+    s_open = held_share(min(offset_c, float(d.get("open_c", OPEN_C))), *args)
     s_open += OCCUPIED_ADD * (1 - s_open)
     return d["cool_kw"] * (free * s_free + (1 - free) * s_open)
 
@@ -110,10 +111,10 @@ class BuildingGuard(Guard):
         self.writers: dict[str, list[dict[str, Any]]] = {}
         self.day_stops: dict[str, str] = {}
         self.mode_writes: dict[str, int] = {}
+        self.mode_day: str | None = None                  # the day mode_writes counts. A box's stored writes are by the day, so a new sale or a restart mustn't start them again
 
     def clear(self) -> None:
         self.writers.clear()
-        self.mode_writes.clear()
 
     def kept(self) -> set[str]:
         """The tools a manager's wish stops. owner.py names a home's tools, so keep_house_as_is reaches the climate tools here."""
@@ -126,6 +127,8 @@ class BuildingGuard(Guard):
         target = str(a.get("target", ""))
         if f.get("alarm"):                                                      # step 1
             return blocked(target, "An alarm is on, so nothing is sent and every agent limit releases.")
+        if f.get("stopped"):
+            return blocked(target, STOPPED)
         if tool not in f["shelf"]:                                              # step 2
             return blocked(target, f"This node has no {tool}.")
         d = next((x for x in f["devices"].values() if x["tool"] == tool and x["target"] == target), None)
@@ -145,6 +148,9 @@ class BuildingGuard(Guard):
         keeps = tool == "set_battery" and a.get("action") in ("hold", "charge")
         if tool in self.kept() and not keeps:                                   # step 5: the owner first
             return blocked(target, owner.why(tool, self.wishes))
+        hidden = off_list(f, tool, target)                                      # step 2: a writer giving back its own call needs no list
+        if hidden and not (tool == "set_zone_standby" and a.get("mode") == "off") and not (tool == "switch_plugs" and a.get("state") == "auto"):
+            return blocked(target, hidden)
         try:
             ans = getattr(self, "_" + tool)(a, d, f, call)                      # steps 3 to 5
         except (KeyError, TypeError, ValueError, AttributeError) as exc:        # no reading, no write
@@ -218,13 +224,13 @@ class BuildingGuard(Guard):
             return "A room in this group is in an exam, so it is never touched."
         if d.get("avoid"):
             return f'This is a time to avoid: {d["avoid"]}.'
-        if not d.get("smoke_ok", True):
+        if not d["smoke_ok"]:
             return "Rule out a smoke role before any write to this unit."
-        if d.get("closet"):
+        if d["closet"]:
             return "A unit in this group also cools a closet, and the driver can't separate them."
-        if d.get("override"):
+        if d["override"]:
             return "An occupant override is running, and it beats the agent."
-        if d.get("humid"):
+        if d["humid"]:
             return "Humidity ends the event: dew point is past 15 C or RH is past 65%."
         return None
 
@@ -234,7 +240,7 @@ class BuildingGuard(Guard):
         stop = self._zone_stop(d)
         if stop:
             return blocked(t, stop)
-        if not d.get("running", True):
+        if not d["running"]:
             return blocked(t, "No cooling is running in this zone, so an offset moves nothing.")
         if c is None:
             return blocked(t, "offset_c must be a number.")
@@ -248,9 +254,12 @@ class BuildingGuard(Guard):
             return self._precool(t, c, d, call, times)
         lead = clock(mins((f.get("sale") or call)["start"]) - RAMP_MIN)
         state = d.get("state", "open")                          # not known means people may be in
+        lim = d.get("limit_c")
+        if lim is not None and lim <= 0:
+            return blocked(t, d.get("limit_why", "This zone may not run warmer now."))
         if state in ("open", "booked") and c > OPEN_C:
             why = "A booked floor stays within +1.5 C." if state == "booked" else "+3 C is for empty zones, and this one is open."
-            return blocked(t, why, {"tool": "set_zone_cooling", "target": t, "offset_c": OPEN_C, "start": lead, "end": times["end"]})
+            return blocked(t, why, {"tool": "set_zone_cooling", "target": t, "offset_c": OPEN_C if lim is None else min(OPEN_C, lim), "start": lead, "end": times["end"]})
         back = self._back_by(d, call)
         if back is not None and c > OPEN_C and span(call)[1] > back:
             try_ = {"offset_c": c, "start": times["start"], "end": clock(back)} if back > span(call)[0] else {"offset_c": OPEN_C, **times}
@@ -258,9 +267,8 @@ class BuildingGuard(Guard):
         applied, status, why = c, "done", ""
         if c > EMPTY_C:
             applied, status, why = EMPTY_C, "adjusted", "+3 C is the most any zone may take."
-        lim = d.get("limit_c")
         if lim is not None and applied > lim:
-            applied, status, why = lim, "adjusted", f"This zone's limit is +{lim:g} C."
+            applied, status, why = lim, "adjusted", d.get("limit_why", f"This zone's limit is +{lim:g} C.")
         top, base = d.get("top_c"), d.get("base_c")
         if top is not None and base is not None and state in ("open", "booked") and base + applied > top + 1e-9:
             applied = math.floor((top - base) * 10 + 1e-9) / 10   # down, or the rounding itself passes the top
@@ -270,8 +278,8 @@ class BuildingGuard(Guard):
         if base is not None and base + applied > SETPOINT_C[1]:
             return blocked(t, "A cooling setpoint stays between 13 and 29 C.")
         out = {"offset_c": applied, **times}
-        if state == "part" and applied > OPEN_C:
-            out["booked_rooms_offset_c"] = OPEN_C               # the controller holds rooms with a booking there
+        if state == "part" and applied > float(d.get("open_c", OPEN_C)):
+            out["booked_rooms_offset_c"] = float(d.get("open_c", OPEN_C))       # the controller holds rooms with a booking there
         kw = zone_kw(d, applied)
         if d.get("plant_covers"):                                # count once: the plant carries this part
             kw *= 1 - float(d.get("plant_part", 1.0))
@@ -298,29 +306,30 @@ class BuildingGuard(Guard):
         times = {k: clock(mins(call[k])) for k in ("start", "end")}
         if mode not in ("on", "off"):
             return blocked(t, "mode must be on or off.")
-        stop = self._zone_stop(d)
         if mode == "off":                                       # keeps the zone on its schedule, and ends any standby this node holds
             ended = self._end("set_zone_standby", d, mins(call["start"]))
-            if stop and not ended:                              # nothing of ours to give back, so nothing is written there
+            stop = None if ended else self._zone_stop(d)
+            if stop:                                            # nothing of ours to give back, so nothing is written there
                 return blocked(t, stop)
             for w in ended:                                     # a stop never holds a zone in standby: this is how it gets out
                 w["ended"] = True
             return {**answer("done", t, {"mode": "off", **times}), "released": True}
+        stop = self._zone_stop(d)
         if stop:
             return blocked(t, stop)
         if d.get("booked") or d.get("event_here"):
             return blocked(t, "This zone holds a booking or an event, so it stays on its schedule.")
-        if d.get("mall_open"):
+        if d["mall_open"]:
             return blocked(t, "No mall zone counts as free while it is open.")
-        if d.get("doas_open"):
+        if d["doas_open"]:
             return blocked(t, "An outdoor air unit stays on until every zone it serves is closed.")
         if d.get("closed"):
             return answer("done", t, {"mode": "on", **times}, 0.0, "Closed wing: the BMS schedule stops its air.")
-        if not d.get("sensors", True):
+        if not d["sensors"]:
             alt = d.get("instead")
             return blocked(t, "Every room needs a working occupant sensor, and CO2 is only a second check.",
                            {"tool": "set_zone_standby", "target": alt, "mode": "on", **times} if alt else None)
-        if not d.get("standby_ok", True):
+        if not d["standby_ok"]:
             return blocked(t, d.get("standby_why", "Its standby would stop outdoor air in an open building."),
                            {"tool": "set_zone_cooling", "target": t, "offset_c": EMPTY_C, "start": clock(mins((f.get("sale") or call)["start"])), "end": times["end"]})
         back = self._back_by(d, call)
@@ -333,6 +342,9 @@ class BuildingGuard(Guard):
             if sale and span(call)[1] - span(call)[0] < mins(sale["end"]) - mins(sale["start"]):
                 return blocked(t, "Each change is a stored write, so one long window replaces short ones.",
                                {"tool": "set_zone_standby", "target": t, "mode": "on", "start": clock(mins(sale["start"])), "end": clock(mins(sale["end"]))})
+            if self.mode_day and self.mode_day != day_of(call, f):
+                self.mode_writes.clear()
+            self.mode_day = day_of(call, f)
             if self.mode_writes.get(t, 0) + 2 > limit:
                 return blocked(t, "Today's mode writes on these boxes are used up.")
         return answer("done", t, {"mode": "on", **times}, 0.0, "The saving shows under limit_air_handler and set_zone_cooling.")
@@ -344,13 +356,13 @@ class BuildingGuard(Guard):
         stop = self._zone_stop(d)
         if stop:
             return blocked(t, stop)
-        if d.get("doas"):
+        if d["doas"]:
             return blocked(t, "A dedicated outdoor air unit holds its flow.")
-        if not d.get("oa_ok", True):
+        if not d["oa_ok"]:
             return blocked(t, "The unit has no outdoor airflow reading, and a fixed damper loses air as the fan slows.")
-        if not d.get("co2_ok", True):
+        if not d["co2_ok"]:
             return blocked(t, "A failed CO2 sensor ends any fan cap on that zone, and design airflow returns.")
-        if d.get("hood"):
+        if d["hood"]:
             return blocked(t, "Hood make-up air takes no fan limit during service.")
         if sp is None:
             return blocked(t, "speed_percent must be a number.")
@@ -361,7 +373,7 @@ class BuildingGuard(Guard):
         now = float(d.get("speed_now", 100.0))
         if sp >= now or floor >= now:                           # lifting the ask to the floor would raise a fan that runs under it
             return blocked(t, "It already runs at or below that speed, and a cap never raises a fan.")
-        if not d.get("eased", True):
+        if not d["eased"]:
             e = d.get("ease_with") or {}
             return blocked(t, "Its zones aren't eased yet, so boxes would starve. Close the boxes first.", with_times(e, call, end=times["end"]) if e else None)
         applied, status, why = sp, "done", ""
@@ -373,21 +385,24 @@ class BuildingGuard(Guard):
     def _set_plant_demand_limit(self, a, d, f, call):
         t, pct = d["target"], num(a.get("limit_percent"))
         times = {k: clock(mins(call[k])) for k in ("start", "end")}
-        if not d.get("running", True):
+        if not d["running"]:
             return blocked(t, "The chillers are off, so there is nothing to cap.")
-        if d.get("computer_room"):
+        if d["computer_room"]:
             return blocked(t, "This plant cools a computer room, and that cooling is never touched.")
         lab = float(d.get("lab_share", 0.0))
-        if lab > 0 and not d.get("lab_live", True):
+        if lab > 0 and not d["lab_live"]:
             return blocked(t, "No live lab load reading, so no cap on this loop.")
-        if not d.get("zones_coast", True):
+        if not d["zones_coast"]:
             z = d.get("ease_with") or {}
             return blocked(t, "Zones on this plant aren't set to coast, so the cap would only warm the water.", with_times(z, call) if z else None)
         if pct is None:
             return blocked(t, "limit_percent must be a number.")
         now = float(d["percent_now"])
+        room, trimmed = d.get("room_percent"), ""
+        if room is not None and pct < room:                     # a person lowered the comfort limit: past this the zones reach it early, and the plant comes back mid-sale
+            pct, trimmed = room, d["limit_why"]
         if pct >= now:
-            return blocked(t, "The chillers already run under that percent, so a cap would move nothing.")
+            return blocked(t, trimmed or "The chillers already run under that percent, so a cap would move nothing.")
         lab_floor = math.ceil(now * lab * (1 + float(d.get("lab_margin", .10))) - 1e-9) if lab > 0 else 0
         chillers = d["chillers"]
         lowest = min(c["floor"] for c in chillers)
@@ -407,23 +422,26 @@ class BuildingGuard(Guard):
             c0 = high[0]
             return answer("adjusted", t, {**{f'{c["name"]} ({c["product"]})': {"limit_percent": per[c["name"]]} for c in chillers}, **times}, kw,
                           f'{c0["product"]} stays at {c0["floor"]:g} percent.')
-        return answer("done", t, {"limit_percent": pct, **times}, kw)
+        return answer("adjusted" if trimmed else "done", t, {"limit_percent": pct, **times}, kw, trimmed)
 
     def _stop_plant_early(self, a, d, f, call):
         t = d["target"]
         times = {k: clock(mins(call[k])) for k in ("start", "end")}
-        if not d.get("whole", True):
+        if not d["whole"]:
             return blocked(t, "Whole plants only: taking one chiller off is staging, and that stays in the BMS.", {"tool": "stop_plant_early", "target": d.get("plant", t), **times})
         if d.get("labs"):
             return blocked(t, "Labs share this water, so it can't stop.")
         if d.get("shared"):
             return blocked(t, "This plant is shared with another building.")
-        if not d.get("running", True):
+        if not d["running"]:
             return blocked(t, "The chillers are off, so there is nothing to stop.")
-        if not d.get("cleared", True):
+        if d["hot"] or d.get("limit_lowered"):                  # the list hides it too, but a rule that keeps people cool can't rest on what a model was shown
+            return blocked(t, f'A stop can\'t be turned down, so {"on a hot evening" if d["hot"] else "with the comfort limit lowered"} the plant keeps running. Cap it instead.',
+                           {"tool": "set_plant_demand_limit", "target": t, "limit_percent": max(c["floor"] for c in d.get("chillers", [{"floor": 70}])), **times})
+        if not d["cleared"]:
             return blocked(t, "No signed list shows that nothing critical hangs on this loop.",
                            {"tool": "set_plant_demand_limit", "target": t, "limit_percent": max(c["floor"] for c in d.get("chillers", [{"floor": 70}])), **times})
-        if not d.get("pre_ran", True):
+        if not d["pre_ran"]:
             return blocked(t, "Pre-cool didn't run today, so there is no stored cold to coast on.",
                            {"tool": "set_plant_demand_limit", "target": t, "limit_percent": max(c["floor"] for c in d.get("chillers", [{"floor": 70}])), **times})
         if d.get("stops_today", 0) >= 1 or self.day_stops.get(t) == day_of(call, f):
@@ -442,26 +460,30 @@ class BuildingGuard(Guard):
             return blocked(t, "A room in this group is in an exam, so it is never touched.")
         if d.get("avoid"):
             return blocked(t, f'This is a time to avoid: {d["avoid"]}.')
-        if d.get("utility"):
+        if d["utility"]:
             return blocked(t, "A utility event holds this target, and utility commands outrank the agent.")
-        if d.get("override"):
+        if d["override"]:
             return blocked(t, "A person's override is running, and the agent never cancels one.")
-        if not d.get("shed_ok", True):
+        if not d["shed_ok"]:
             alt = d.get("instead")
             return blocked(t, "An area here reads Load shed Allowed No, and the agent can't change that point.",
                            {"tool": "dim_lights", "target": alt, "cut_percent": cut, **times} if alt else None)
-        if not d.get("running", True):
+        if not d["running"]:
             return blocked(t, "The lights are already off, so there is no kW to move.")
         if cut is None or cut < 1 or cut > 100:
             return blocked(t, "cut_percent must be 1 to 50, or 100 for off.")
         kw, lim = float(d["running_kw"]) * float(d.get("scale", 1.0)), min(MAX_DIM, float(d.get("limit_pct", MAX_DIM)))     # a map can lower the 50%, never raise it
+        if lim <= 0:
+            return blocked(t, d.get("limit_why", "No dim is allowed here now."))
         fc = float(d.get("egress_fc") or 0.0)
-        if d.get("egress") and cut != 100:                      # 1 fc stays at the darkest point: 1.6 fc measured gives 37%, and no measure gives no dim
+        if d["egress"] and cut != 100:                          # 1 fc stays at the darkest point: 1.6 fc measured gives 37%, and no measure gives no dim
             if fc <= 1.0:
                 return blocked(t, "This zone is on an exit route with no measured light to spare, so it takes no dim.")
             lim = min(lim, float(math.floor(100 * (1 - 1 / fc))))
         if cut == 100:
-            if not d.get("all_empty") or d.get("egress"):
+            if d.get("limit_lowered"):                          # a person's limit binds off as well
+                return blocked(t, d.get("limit_why", "A person lowered this limit."), {"tool": "dim_lights", "target": t, "cut_percent": lim, **times})
+            if not d.get("all_empty") or d["egress"]:
                 return blocked(t, "Off needs every area empty, and away from exit routes.", {"tool": "dim_lights", "target": t, "cut_percent": lim, **times})
             return answer("done", t, {"cut_percent": 100, **times}, kw)
         if cut > lim:
@@ -484,12 +506,12 @@ class BuildingGuard(Guard):
             return {**answer("done", t, {"state": "auto", **times}, 0.0, "The plugs go back to their sensors."), "released": True}
         if any(w.get("handed_back") for p in self._points("switch_plugs", d) for w in self.writers.get(p, [])):
             return blocked(t, "One off and one hand-back per group per window, and this group has had both.")
-        if d.get("override"):
+        if d["override"]:
             return blocked(t, "An occupant override is running, and the agent never removes one.")
-        if not d.get("loads_ok", True):
+        if not d["loads_ok"]:
             alt = d.get("instead")
             return blocked(t, d.get("loads_why", "The group holds a load that can't be switched."), {"tool": "switch_plugs", "target": alt, "state": "off", **times} if alt else None)
-        if not d.get("any_time") and not d.get("free", True):
+        if not d.get("any_time") and not d["free"]:
             return blocked(t, "Only free zones: empty, with no booking. Unknown counts as occupied.")
         return answer("done", t, {"state": "off", **times}, float(d["can_give_kw"]))
 
@@ -503,7 +525,7 @@ class BuildingGuard(Guard):
             return blocked(t, "The battery tripped in the last 10 minutes. It stays off and the agent doesn't retry.")
         for k, why in (("utility", "A utility command is active, so the plan stands down and reports."), ("generator", "A generator is running, so the plan stands down."),
                        ("other_program", "Another program holds these hours for this battery.")):
-            if d.get(k):
+            if d[k]:
                 return blocked(t, why)
         if act == "hold":
             if kw:
@@ -555,7 +577,7 @@ class BuildingGuard(Guard):
     def _limit_ev_charging(self, a, d, f, call):
         t, amps = d["target"], num(a.get("amps"))
         times = {k: clock(mins(call[k])) for k in ("start", "end")}
-        if not d.get("control", True):
+        if not d["control"]:
             alt = d.get("instead")
             return blocked(t, "Those ports have no control path.", {"tool": "limit_ev_charging", "target": alt, "amps": a.get("amps"), **times} if alt else None)
         if amps is None or amps < 0 or 0 < amps < AMPS[0] or amps > AMPS[1]:

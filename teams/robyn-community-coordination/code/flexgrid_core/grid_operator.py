@@ -9,15 +9,15 @@ confirm, baselines, signed meter readings, settlement); only three things differ
   * its meters: the data centers'. Meter history = each site in default operation (every job runs on arrival,
     battery idle), from data/datacenters/ (flexgrid_core/datacenter.py)
   * its name: `grid_operator_name` (default "grid-operator"), with its own signing key
-Baseline: Ameren Rider PTR (3 highest of the 14 previous non-holiday, non-event days), as for the homes. A data
-center's load hardly follows the weather, so the PTR's "highest 3 of 14" sits a little above a normal day.
+Baseline: settlement.baseline_rule(), as for the homes. A data center's load hardly follows the weather, so the
+Ameren Rider PTR's "highest 3 of 14", where that rule is in force, sits a little above a normal day.
 """
 from __future__ import annotations
 
 import json
 from typing import Any
 
-from . import beckn, config, datacenter as dc, settlement as st, signing
+from . import beckn, datacenter as dc, settlement as st
 from .utility import Utility
 
 
@@ -28,20 +28,18 @@ class GridOperator(Utility):
     ORDER_PREFIX = "dc-flex-need-"
 
     def __init__(self):
-        super().__init__()
+        super().__init__("grid_operator.key")
         c = self.cfg
         # a program sized to its fleet: the dataset's order_max_kw lifts the ceiling (none: the 100 MW of the ten sites)
         self.ORDER_MAX_KW = float(c.get("dc_order_max_kw") or dc.files().get("order_max_kw") or type(self).ORDER_MAX_KW)
         self.name = c.get("grid_operator_name", "grid-operator")
-        self.key = signing.load_or_create(config.CONFIG_DIR / "secrets" / "grid_operator.key")
-        self.pub = signing.public_hex(self.key)
         self.catalog = dc.events_catalog()
         self.fleet = {}
         self.event_days = {beckn.need_from_catalog(r, o)["window_start"][:10] for r, o in self._pairs()}
         self.aggregators = set(c.get("grid_operator_aggregators") or ["coordinator"])
 
     def baselines(self, ct: dict[str, Any], meters: list[str]) -> dict[str, dict[str, dict[str, float]]]:
-        """Each data center's Rider PTR baseline per slot, from its own meter history in default operation."""
+        """Each data center's baseline per slot, from its own meter history in default operation."""
         need = ct["need"]
         day = need["window_start"][:10]
         ev_days = {st.day_of(x) for x in self.event_days}

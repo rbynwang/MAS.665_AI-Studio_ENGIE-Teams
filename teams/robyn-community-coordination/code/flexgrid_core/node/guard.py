@@ -15,6 +15,7 @@ from . import owner
 from .see import hhmm
 
 VOLTS = 240.0
+STOPPED = "A person took this node out of the sale, so nothing is sent."
 
 
 def answer(status: str, target: str, applied: dict[str, Any] | None = None, expected_kw: float = 0.0, why: str = "",
@@ -25,6 +26,14 @@ def answer(status: str, target: str, applied: dict[str, Any] | None = None, expe
 
 def blocked(target: str, why: str, try_instead: dict[str, Any] | None = None) -> dict[str, Any]:
     return answer("blocked", target, why=why, try_instead=try_instead)
+
+
+def off_list(f: dict[str, Any], tool: str, target: str) -> str | None:
+    """The turn's list is a limit too: some rules live only in what it hides, like the plant on a hot evening. Why it's refused, or None. The list is in the facts, so a replay reads the same one."""
+    m = f.get("menu")
+    if m is None or (tool in m and (not m[tool] or target in m[tool])):
+        return None
+    return f"{tool} on {target or 'that target'} isn't on this step's list, so nothing was sent."
 
 
 def num(x: Any) -> float | None:
@@ -54,6 +63,8 @@ class Guard:
         target = str(a.get("target", ""))
         if f.get("alarm"):                                                      # step 1
             return blocked(target, "An alarm is on, so nothing is sent and every agent limit releases.")
+        if f.get("stopped"):
+            return blocked(target, STOPPED)
         d = next((x for x in f["devices"].values() if x["tool"] == tool and x["target"] == target), None)
         if tool not in f["shelf"]:                                              # step 2
             return blocked(target, f"This node has no {tool}.")
@@ -63,6 +74,9 @@ class Guard:
         keeps = tool == "set_battery" and a.get("action") in ("hold", "charge")
         if tool in owner.blocked_tools(self.wishes) and not keeps:              # step 5: the owner first
             return blocked(target, owner.why(tool, self.wishes))
+        hidden = off_list(f, tool, target)                                      # step 2: the list comes after the owner, whose words say more
+        if hidden:
+            return blocked(target, hidden)
         ans = getattr(self, "_" + tool)(a, d, f, call)                          # steps 3 to 5
         if ans["status"] in ("done", "adjusted"):                               # step 6
             w = self.writers.get(target)

@@ -142,6 +142,10 @@ class BuildingController(rt_home.RollingController):
         self._fit_cache: dict[tuple, tuple[float, float] | None] = {}
         self._dev_fc: dict[tuple[str, str], float] = {}
 
+    def afresh(self) -> None:
+        super().afresh()
+        self._dims, self._fit_cache, self._dev_fc = {}, {}, {}
+
     def active(self, i: int) -> bool:
         """The plan stays out between a pre-cool and the sale: left alone, it spends the stored cold on the afternoon's bill."""
         return False if self.sim.hold_cold else super().active(i)
@@ -241,7 +245,7 @@ class BuildingController(rt_home.RollingController):
             occ.append(int(self.house.at(t)[3]))
         n = len(ts)
         p = rt_control.Problem(ts=ts, dt=[0.25] * n, pv=[0.0] * n, load=list(cool), cool=cool, cop=cop, occ=occ, ref=list(cool), target=[0.0] * n,
-                               watch=[True] * n, ua=self.house.ua, cap=self.house.cap, qmax=self.house.qmax, limits=self.limits, x0=0.0,
+                               watch=[True] * n, ua=self.house.ua, cap=self.house.cap, qmax=self.house.qmax, limits=self.said_limits(), x0=0.0,
                                comfort_weight=self.comfort_weight())
         call = [window_start <= t < window_end for t in ts]
         kw = rt_control.capacity(p, call, None)
@@ -363,6 +367,12 @@ class SimulatedBuilding(SimulatedHome):
         self.ctl = BuildingController(self, self.house, rt_control.Limits(**cfg["owner_limits"]))
         self._own_devices(cfg.get("name") or cfg.get("agent_name") or "")
 
+    def afresh(self) -> None:
+        super().afresh()
+        self.hold_cold = False
+        self.x_recent.clear()
+        self.house.cut, self.house.cut_span = 0.0, ("", "9")
+
     def _own_devices(self, name: str) -> None:
         """A 2026 building's fans, plugs and EV ports are always on: FG_DEVICES names the homes' devices, not these."""
         try:
@@ -412,17 +422,21 @@ class SimulatedBuilding(SimulatedHome):
         night = bool(ts) and (ts[11:13] >= "23" or ts[11:13] < "06")
         return -min(can_ch, self.P) if night and soc < self.SM - 1e-3 else 0.0
 
-    def dim_max(self) -> float:
-        """The share of the lights that may be dimmed now: what the agent's calls opened, else the facility manager's override,
-        else the default."""
-        if self.levers is not None:
-            return max(0.0, min(LIGHT_DIM_HARD_MAX, float(self.levers.get("light_share", 0.0))))
+    def light_limit(self) -> float:
+        """The share of the lights a person allows dimmed now, whoever runs the node: the facility manager's override, else the default."""
         v = (self.overrides or {}).get("lights")
         v = self.light_default if v is None else v
         try:
             return max(0.0, min(LIGHT_DIM_HARD_MAX, float(v)))
         except (TypeError, ValueError):
             return self.light_default
+
+    def dim_max(self) -> float:
+        """The share of the lights that may be dimmed now: what the agent's calls opened, never past the limit. With no levers, the limit."""
+        lim = self.light_limit()
+        if self.levers is None:
+            return 0.0 if "lighting" in self.held_out else lim
+        return max(0.0, min(lim, float(self.levers.get("light_share", 0.0))))
 
     def light_scale(self, ts: str) -> float:
         return 1.0 if self.levers is not None else self.free_scale(ts)
@@ -434,7 +448,9 @@ class SimulatedBuilding(SimulatedHome):
         other = super()._light_dim(ts, decided)                 # benchmark: its other smart systems
         if decided is None or (self.overrides or {}).get("stop"):
             return other
-        return other + max(0.0, min(self.ctl.light_cap(ts), float(decided.get("dim", 0.0))))
+        want, cap = float(decided.get("dim", 0.0)), self.ctl.light_cap(ts)
+        self._clip("light_kw", ts, want, cap)
+        return other + max(0.0, min(cap, want))
 
     def _release_plant(self, ts: str) -> None:
         """A cap or a stop ends when the zones reach their limit: the plant comes back, and the agent hears why (the card's step 5)."""
@@ -466,6 +482,8 @@ class SimulatedBuilding(SimulatedHome):
         if kind in ("ev_now", "depart_at"):
             return
         super().rt_override(kind, value)
+        if kind == "stop" and value not in (None, False):
+            self.house.cut = 0.0                  # a cap or a stop on the plant goes with the node: otherwise cooling stays down after a person's stop
         if kind == "alarm" and value not in (None, False):
             # Life safety, whoever runs the node: levers set to None would let the plan keep every device, so the plan stands down until a person clears it
             self.house.cut = 0.0
@@ -473,6 +491,6 @@ class SimulatedBuilding(SimulatedHome):
 
     def limits(self) -> dict[str, Any]:
         out = super().limits()
-        out.update({"node": "building", "light_dim_max": round(self.dim_max(), 2),
+        out.update({"node": "building", "light_dim_max": round(self.light_limit(), 2),
                     "comfort_max_rise_c": self.ctl.limits.max_rise_c if self.ctl else None})
         return out

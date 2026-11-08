@@ -31,12 +31,11 @@ import json
 import math
 import threading
 import time
-import uuid
 from collections import deque
 from concurrent.futures import Future
 from typing import Any, Callable
 
-from . import beckn, config, signing
+from . import beckn, config, ids, signing
 
 STEP_H = 0.25
 POST_STEPS = 32                          # the evening after the window that offers forecast (8 h), as homes do
@@ -535,6 +534,7 @@ class DataCenterAgent:
         self.contracts: dict[str, dict[str, Any]] = {}
         self.payments: list[dict[str, Any]] = []
         self.reputation = float(cfg.get("reputation", 1.0))
+        self.play = ids.new_play()                           # in every id it sends (ids.py). dc_fleet builds new agents for each run, so each run has its own
         self._fc_now: int | None = None
         self._lock = threading.Lock()
         # the AI agent (brain.DataCenterBrain), attached by flexgrid-dc for the sites in dc_llm_sites only: it decides
@@ -663,11 +663,14 @@ class DataCenterAgent:
                  "valid_until": need["commit_by"], "made_at": self.now_ts()}
         return offer
 
-    def send_offer(self, txn: str, offer: dict[str, Any]) -> dict[str, Any]:
+    def mid(self, to: str, kind: str, *key: Any, asked: str | None = None) -> str:
+        """The id of one of this site's messages, as a home's (home_v2.HomeV2.mid)."""
+        return ids.sealed(None if asked else self.key, asked or self.play, self.name, to, kind, *key)
+
+    def send_offer(self, txn: str, offer: dict[str, Any], asked: str | None = None) -> dict[str, Any]:
         body = beckn.make("on_discover", sender=self.name, receiver=self.coordinator, transaction_id=txn,
                           message={"offer": offer}, key=self.key, sender_role="bpp")
-        out = self.send(self.coordinator, beckn.kind("on_discover"), body,
-                        f"{self.name}:offer:{offer['event_id']}:{uuid.uuid4().hex[:6]}")
+        out = self.send(self.coordinator, beckn.kind("on_discover"), body, self.mid(self.coordinator, "on_discover", offer["event_id"], asked=asked))
         self.log("v2_offer_sent", event_id=offer["event_id"], kw=[x["kw_offered"] for x in offer["slots"]],
                  confidence=offer["confidence"])
         return {"sent": out, "summary": f"Offer for {offer['event_id']}: {[x['kw_offered'] for x in offer['slots']]} kW"}
@@ -744,7 +747,7 @@ class DataCenterAgent:
         self.contracts[c["id"]] = {**c, "status": "ACCEPTED", "reported": [], "accepted_at": self.now_ts()}
         return {"installed": True, "steps": len(actions)}
 
-    def answer(self, txn: str, c: dict[str, Any], verdict: dict[str, Any]) -> dict[str, Any]:
+    def answer(self, txn: str, c: dict[str, Any], verdict: dict[str, Any], asked: str | None = None) -> dict[str, Any]:
         prev = self.contracts.get(c.get("id")) if c.get("id") else None
         if prev and prev.get("status") in ("ACCEPTED", "DECLINED"):
             verdict = {"decision": prev["status"], "reason": prev.get("reason", "within_offer_and_safe"),
@@ -755,8 +758,7 @@ class DataCenterAgent:
                           message={"contract": {"id": c.get("id"), "event_id": c.get("event_id"), "home": self.name,
                                                 "status": verdict["decision"], "reason": verdict["reason"]}},
                           key=self.key, sender_role="bpp")
-        out = self.send(self.coordinator, beckn.kind("on_confirm"), body,
-                        f"{self.name}:answer:{c.get('id')}:{uuid.uuid4().hex[:6]}")
+        out = self.send(self.coordinator, beckn.kind("on_confirm"), body, self.mid(self.coordinator, "on_confirm", c.get("id"), asked=asked))
         self.log("v2_contract_" + verdict["decision"].lower(), contract_id=c.get("id"), reason=verdict["reason"])
         return {"sent": out, "summary": f"Contract {c.get('id')}: {verdict['decision']} ({verdict['reason']})."}
 
@@ -791,15 +793,13 @@ class DataCenterAgent:
         body = beckn.make("on_status", sender=self.name, receiver=self.coordinator, transaction_id=txn,
                           message={"performance": reading}, key=self.key, sender_role="bpp",
                           ttl_s=beckn.TTL_EVIDENCE_S)
-        out = self.send(self.coordinator, beckn.kind("on_status"), body,
-                        f"{self.name}:reading:{reading['contract_id']}:{reading['slot_id']}:{uuid.uuid4().hex[:6]}")
+        out = self.send(self.coordinator, beckn.kind("on_status"), body, self.mid(self.coordinator, "on_status", reading["contract_id"], reading["slot_id"]))
         util = self.cfg.get("utility_name", "grid-operator")
         meter = {k: v for k, v in reading.items() if k != "truth"}
         ubody = beckn.make("on_status", sender=self.name, receiver=util, transaction_id=txn,
                            message={"performance": meter}, key=self.key, sender_role="bpp",
                                ttl_s=beckn.TTL_EVIDENCE_S)
-        uout = self.send(util, beckn.kind("on_status"), ubody,
-                         f"{self.name}:meter:{reading['contract_id']}:{reading['slot_id']}:{uuid.uuid4().hex[:6]}")
+        uout = self.send(util, beckn.kind("on_status"), ubody, self.mid(util, "on_status", reading["contract_id"], reading["slot_id"]))
         self._mark_reported(reading["contract_id"], reading["slot_id"], [out, uout])
         return {"sent": out, "summary": f"Slot {reading['slot_id']}: committed {reading['committed_kw']} kW, "
                                         f"meter {reading['usage_kw']} kW"}
@@ -856,10 +856,10 @@ class DataCenterAgent:
         with self._lock:
             return sorted(str(k[0]) for k in self._thinking)
 
-    def _offer_in_background(self, txn: str, need: dict[str, Any]) -> str:
+    def _offer_in_background(self, txn: str, need: dict[str, Any], asked: str | None = None) -> str:
         eid = need["event_id"]
         if eid in self.offers:                       # decided already (the call for offers came again): the same offer
-            return self.send_offer(txn, self.offers[eid])["summary"]
+            return self.send_offer(txn, self.offers[eid], asked)["summary"]
         safe = self.safe_offer(need)
 
         def work() -> None:
@@ -872,16 +872,17 @@ class DataCenterAgent:
                 if self.closed or eid in self.offers:
                     return
                 self.offers[eid] = offer
-                self.send_offer(txn, offer)
+                self.send_offer(txn, offer, asked)
         if self._think(("offer", eid), work):
             return f"the AI agent decides how much of its safe offer ({safe['energy_kwh']:.0f} kWh) to give"
         return "the AI agent is still deciding its offer"
 
     def _accept_in_background(self, txn: str, c: dict[str, Any], sender: str, body: dict[str, Any]) -> str:
         v = self.verify_contract(sender, body, ask_agent=False)
+        asked = ids.asked(body)
         if v["decision"] != "ACCEPTED":              # the guard said no: the agent is not asked
             self.install_plan(c, v)
-            return self.answer(txn, c, v)["summary"]
+            return self.answer(txn, c, v, asked)["summary"]
 
         def work() -> None:
             try:
@@ -897,7 +898,7 @@ class DataCenterAgent:
                 if self.now_ts() >= c.get("opt_out_by", "9999"):
                     verdict = {"decision": "DECLINED", "reason": "past_opt_out_deadline", "contract_id": c.get("id")}
                 self.install_plan(c, verdict)
-                self.answer(txn, c, verdict)
+                self.answer(txn, c, verdict, asked)
         if self._think(("accept", c.get("id")), work):
             return "the guard found it safe: the AI agent decides whether to accept"
         return "the AI agent is still deciding whether to accept"
@@ -907,15 +908,16 @@ class DataCenterAgent:
         if sender != self.coordinator or body.get("signer") not in self.trusted() or \
                 not beckn.check(body, body.get("signer", "")):
             self.log("v2_rejected_message", message_kind=kind, sender=sender)
-            return "rejected: not from a trusted coordinator"
+            return beckn.Refused("rejected: not from a trusted coordinator")
         return None
 
     def handle(self, kind: str, sender: str, body: dict[str, Any]) -> str:
         act = beckn.action_of(kind)
         txn = body.get("context", {}).get("transactionId", "")
+        asked = ids.asked(body)
         late = beckn.expired(body, default_ttl=float(self.cfg.get("max_message_age_s", 900)))
         if late:
-            return f"expired {round(late)} s ago: not acted on"
+            return beckn.Refused(f"expired {round(late)} s ago: not acted on")
         rejected = self.gate(kind, sender, body)
         if rejected:
             return rejected
@@ -923,20 +925,20 @@ class DataCenterAgent:
         background = self.brain is not None and bool(self.cfg.get("think_in_background"))
         if act == "discover":
             if background:
-                return self._offer_in_background(txn, m["intent"]["need"])
-            return self.send_offer(txn, self.build_offer(m["intent"]["need"]))["summary"]
+                return self._offer_in_background(txn, m["intent"]["need"], asked)
+            return self.send_offer(txn, self.build_offer(m["intent"]["need"]), asked)["summary"]
         if act == "confirm":
             c = {**m["contract"], "transaction_id": txn}
             prev = self.contracts.get(c.get("id"))
             if prev and prev.get("status") in ("ACCEPTED", "DECLINED"):
                 v = {"decision": prev["status"], "reason": prev.get("reason", "within_offer_and_safe"),
                      "contract_id": c.get("id")}
-                return self.answer(txn, c, v)["summary"]
+                return self.answer(txn, c, v, asked)["summary"]
             if background:
                 return self._accept_in_background(txn, c, sender, body)
             v = self.verify_contract(sender, body)
             self.install_plan(c, v)
-            return self.answer(txn, c, v)["summary"]
+            return self.answer(txn, c, v, asked)["summary"]
         if act == "cancel":                                 # the desk froze the deal without this site's late yes
             cid = (m.get("contract") or {}).get("id")
             c = self.contracts.get(cid)
@@ -949,14 +951,14 @@ class DataCenterAgent:
                 self.log("v2_contract_cancelled", contract_id=cid, reason=c["reason"])
             return f"contract {cid} cancelled"
         if act == "rt_ask":                                 # the desk asks, during the day: how much more?
-            return self.rt_answer(txn, m["ask"])
+            return self.rt_answer(txn, m["ask"], asked)
         if act == "rt_dispatch":
             return self.rt_take(txn, m["dispatch"])
         if act == "update" and "clean_allowance" in m:
             a = m["clean_allowance"]
             i0 = self.site.s.idx_of(a["start"])
             if i0 is None:
-                return "clean allowance ignored: unknown start"
+                return beckn.Refused("clean allowance ignored: unknown start")
             self.site.set_allowance(i0, [max(0.0, float(v)) for v in a["kw"]])
             self.log("dc_clean_allowance", start=a["start"], kwh=round(sum(a["kw"]) * STEP_H, 1))
             return f"clean allowance for {a['start'][:10]}: {round(sum(a['kw']) * STEP_H)} kWh"
@@ -971,7 +973,7 @@ class DataCenterAgent:
             self.reputation = float(st.get("reputation", self.reputation))
             self.log("v2_paid", event_id=st.get("event_id"), usd=st.get("payment"), delivered_kwh=st.get("delivered_kwh"))
             return f"payment noted: {st.get('payment')}"
-        return f"ignored {kind}"
+        return beckn.Refused(f"ignored {kind}")
 
     # --- the real-time design (rt_market.py): calls and gaps during the day, as the homes ----------------------
     def _rt_steps(self, start: str, end: str) -> list[int]:
@@ -1016,12 +1018,12 @@ class DataCenterAgent:
             lo, hi = (mid, hi) if sum(self._cover(steps, mid)) < 1e-3 else (lo, mid)
         return {"kw": round(lo * 0.95, 1), "why": "batch work it can hold and battery above its backup reserve"}
 
-    def rt_answer(self, txn: str, ask: dict[str, Any]) -> str:
+    def rt_answer(self, txn: str, ask: dict[str, Any], asked: str | None = None) -> str:
         cap = self.rt_capacity(ask["start"], ask["end"])
         body = beckn.make("rt_answer", sender=self.name, receiver=self.coordinator, transaction_id=txn,
                           message={"answer": {"id": ask["id"], "kw": cap["kw"], "why": cap.get("why")}},
                           key=self.key, sender_role="bpp")
-        self.send(self.coordinator, beckn.kind("rt_answer"), body, f"{self.name}:rt_answer:{ask['id']}:{uuid.uuid4().hex[:6]}")
+        self.send(self.coordinator, beckn.kind("rt_answer"), body, self.mid(self.coordinator, "rt_answer", ask["id"], asked=asked))
         self.log("rt_answer", call_id=ask["id"], kw=cap["kw"], why=cap.get("why"))
         return f"can add {cap['kw']} kW for {ask['id']}"
 
@@ -1075,9 +1077,9 @@ class DataCenterAgent:
             return
         reason = "an urgent job that cannot wait" if s.urgent_jobs else ("its battery is out" if s.battery_out else
                                                                           "less batch work to hold than forecast")
-        body = beckn.make("rt_capacity", sender=self.name, receiver=self.coordinator, transaction_id=f"cap-{self.name}",
-                          message={"short": short, "reason": reason}, key=self.key, sender_role="bpp")
-        self.send(self.coordinator, beckn.kind("rt_capacity"), body, f"{self.name}:rt_capacity:{uuid.uuid4().hex[:6]}")
+        msg = {"short": short, "reason": reason}
+        body = beckn.make("rt_capacity", sender=self.name, receiver=self.coordinator, transaction_id=f"cap-{self.name}", message=msg, key=self.key, sender_role="bpp")
+        self.send(self.coordinator, beckn.kind("rt_capacity"), body, self.mid(self.coordinator, "rt_capacity", self.now_ts(), ids.digest(msg)))
         self._rt_reported = short
         self.log("rt_capacity", short_kw=max(short.values()), steps=len(short), reason=reason)
 

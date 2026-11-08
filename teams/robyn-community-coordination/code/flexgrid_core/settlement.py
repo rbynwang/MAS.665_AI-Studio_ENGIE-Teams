@@ -16,6 +16,18 @@ ameren_baseline - Ameren Illinois Peak Time Rewards baseline (Rider PTR, Sheet 5
 split       - the coordinator's rule for sharing the seller's revenue: pro rata to each home's measured
               delivery (clamp0(BASELINE - USAGE) summed over the event), minus a coordinator fee (default 0).
 USAGE is consumption at the meter in kW (import positive); a home exporting has negative USAGE.
+
+Under FG_MARKET=2026, the rules every run now uses, three of those give way:
+  ten_of_ten stands in for ameren_baseline, with the same-day adjustment on top (adjusted)
+  deg_settle pays for all that was delivered: its cap at the offer and its penalty are off
+  share_out stands in for split. A node gets the order's price on each kWh it delivered, times its class's share in price_book.json, and a buyer pays each class's own rate: the
+  price x the class's share / (1 - coordinator_keeps). So the coordinator keeps coordinator_keeps of the bill, whatever the mix. At $2.04 a battery's or two-way car's kWh costs
+  $2.04, a building's $1.479 and another home device's $0.5355, and the order's price is the most a kWh can cost. A home's battery and the rest of its load keep their own shares,
+  and a building's battery earns the business rate (meter_kwh).
+  A settlement carries two sums: `total`, the bill, and `full_price_usd`, the same kWh at the order's price. A node's rate reads the second, so its pay doesn't hang on the bill. The coordinator works
+  both out again from the buyer's meters and the order's price (market.own_sums). A buyer's word stands only when it's the same to the cent: otherwise its own sum stands, and it's an alarm.
+  A book with no coordinator_keeps (data_ma's) keeps the one price: there the bill is the full price and the coordinator keeps what the shares leave.
+baseline_rule, pay_rule, bill_rule and policy_rule say which rule is in force. A signed record states its rule from them, so the rule and its words can't part.
 """
 from __future__ import annotations
 
@@ -34,6 +46,75 @@ def price_book() -> dict[str, Any]:
         from .config import data_path
         _BOOK = json.loads(data_path("devices/price_book.json").read_text())
     return _BOOK
+
+
+def baseline_rule() -> str:
+    """The baseline in force, as a record states it."""
+    from .config import dataset_meta
+    if not MARKET:
+        return ("Ameren PTR: 3 highest of the 14 previous non-holiday, non-event days" if dataset_meta().get("name") == "il2023"
+                else "3 highest of the 14 previous non-holiday, non-event days (the Rider PTR method)")
+    lift = ", plus the meter's load in the hour starting 2 hours before the event, above its baseline for that hour" if price_book().get("same_day_adjustment") else ""
+    return f"mean of the last 10 days of the same kind, weekday or weekend, that aren't holidays or event days{lift}"
+
+
+def catalog_terms(catalog: dict[str, Any]) -> dict[str, Any]:
+    """A buyer's catalog as it goes out. The dataset's names the old rules, and its offers are signed on every step of a sale, so under the 2026 rules they say what's in force."""
+    if MARKET:
+        for o in catalog["offers"]:
+            a = o["offerAttributes"]
+            a["contractAttributes"]["policy"]["changed"] = "cap at the offer and shortfall penalty off" + ("" if keeps() is None else f"; each kWh billed at the price x its class's share / {1 - keeps():g}")
+            if o.get("descriptor", {}).get("shortDesc"):
+                o["descriptor"]["shortDesc"] = up_to() + o["descriptor"]["shortDesc"]
+            for side in a["inputs"]:
+                if side["role"] == "buyer":
+                    side["inputs"]["baselineMethodology"] = {"lastOf": 10, "sameKind": True, "sameDayAdjustment": bool(price_book().get("same_day_adjustment"))}
+    return catalog
+
+
+def keeps() -> float | None:
+    """The coordinator's part of a bill, from the price book. None: a book that states none, where a buyer pays the one price."""
+    k = price_book().get("coordinator_keeps")
+    return None if k is None else float(k)
+
+
+def keep_words() -> str:
+    """What follows a node's share in any rule the 2026 market states."""
+    k = keeps()
+    return "The coordinator keeps the rest" if k is None else f"The buyer pays that divided by {1 - k:g}, so the coordinator keeps {k:g} of the bill"
+
+
+def up_to() -> str:
+    """What goes before a price wherever one is shown: under each class's rate the order's price is the most a kWh can cost."""
+    return "up to " if MARKET and keeps() is not None else ""
+
+
+def class_rule() -> str:
+    """share_out's rule, as a contract and a payment state it."""
+    x = price_book()["x"]
+    return (f"the order's price on each measured kWh a node delivered, times its class's share: home battery or two-way car {x['home_battery']:g}, building {x['building']:g}, "
+            f"any other home device {x['home_other']:g}. {keep_words()} (devices/price_book.json)")
+
+
+def pay_rule() -> str:
+    """How a node's pay follows from its delivery, in the rules in force."""
+    return class_rule() if MARKET else "pro rata to measured delivery"
+
+
+def bill_rule() -> str:
+    """What a buyer pays, as an order, a settlement and a model's facts state it."""
+    k = keeps()
+    if not MARKET or k is None:
+        return "the order's price on every measured kWh"
+    x = {c: f"{v / (1 - k):g}" for c, v in price_book()["x"].items()}
+    return (f"each measured kWh at its class's own rate, the order's price times {x['home_battery']} for a home battery or two-way car, {x['building']} for a building and "
+            f"{x['home_other']} for any other home device, so the order's price is the most a kWh can cost and the coordinator keeps {k:g} of the bill")
+
+
+def policy_rule() -> str:
+    """What a settlement was worked out under."""
+    port = "beckn/DEG specification/policies/demand-flex-contractpolicy.rego (ported)"
+    return f"{port}, with its cap and penalty off: paid for all that was delivered, stopping at the capacity sold only in a half hour a call covers. The bill: {bill_rule()}" if MARKET else port
 
 
 def similar_days(event_day: date, event_days: set[date], n: int = 10, max_back: int = 70) -> list[date]:
@@ -75,7 +156,7 @@ def node_class(name: str, building: bool = False) -> str:
 
 def meter_kwh(m: dict[Any, dict[str, float]], hours: float, cap: dict[Any, float] | None = None,
               building: bool = False, name: str = "") -> tuple[dict[str, float], dict[str, float]]:
-    """Per slot: (kWh delivered, kWh the node itself is paid for at the buyer's price: its share of it), under the 2026 rules.
+    """Per slot: (kWh delivered, kWh the node itself is paid for at the order's price: its share of it), under the 2026 rules.
     cap: a building's kW per slot."""
     b = price_book()
     rest, batt = {}, {}
@@ -109,14 +190,21 @@ def trim_called(val: dict[str, tuple[dict[str, float], dict[str, float]]], cappe
                         d[str(sid)] *= f
 
 
-def share_out(seller: float, val: dict[str, tuple[dict[str, float], dict[str, float]]]) -> dict[str, Any]:
-    """Each node's pay at the buyer's price and its class's share; the aggregator keeps the rest."""
+def within(per: dict[str, float], bill: float) -> dict[str, float]:
+    """No split pays out more than its bills brought in. A full price the bills don't bear out could ask for it: a buyer's word, or a copy of the meters short of what the split reads."""
+    pool = sum(per.values())
+    return per if pool <= bill else {h: v * bill / pool for h, v in per.items()}
+
+
+def share_out(seller: float, full: float, val: dict[str, tuple[dict[str, float], dict[str, float]]]) -> dict[str, Any]:
+    """seller: the bills. full: the same kWh at the order's price. Each node's pay is that price, read as full over the kWh, times its class's share, so a change in the
+    bill can't move it. The coordinator keeps the difference: coordinator_keeps of the bill, when the buyers' meters are the ones the split reads."""
     kwh = sum(sum(v[0].values()) for v in val.values())
-    rate = seller / kwh if kwh > 0 else 0.0
-    per = {h: round(sum(v[1].values()) * rate, 4) for h, v in val.items()}
+    rate = full / kwh if kwh > 0 else 0.0
+    per = {h: round(v, 4) for h, v in within({h: sum(v[1].values()) * rate for h, v in val.items()}, seller).items()}
     pool = sum(per.values())
     return {"pool": round(pool, 4), "fee": round(seller - pool, 4), "per_home": per, "usd_per_kwh": round(rate, 4),
-            "rule": "the buyer's price on what each node delivered, times its class's share (data_ma/devices/price_book.json)"}
+            "rule": class_rule()}
 
 # Ameren Illinois Rider PTR holidays, 2023: New Year's Day (Sun 1 Jan, so Mon 2 Jan as well), Memorial Day,
 # Fourth of July, Labor Day, Thanksgiving Day, Christmas Day. Not the federal (OPM) list: no MLK, Presidents',
@@ -149,8 +237,10 @@ def deg_settle(slots: list[dict[str, Any]], offered: dict[int, float], meters: d
     BUILDING_CAP_X x its commitment, see building_counted_kwh); the homes have none, so their settlement is the port's.
     share: {slot_id: 0-1}, this buyer's part of what the pool delivered, when two buyers' orders fill from one pool (market.py).
     Each buyer settles its own part on the same meters, so no kWh is paid for twice.
-    capped: {slot_id: kW}, the half hours a call covers: the booking stops at the capacity sold, because the call pays for what's beyond it."""
-    rows, total = [], 0.0
+    capped: {slot_id: kW}, the half hours a call covers: the booking stops at the capacity sold, because the call pays for what's beyond it.
+    Under the 2026 rules `total` is the bill, each kWh at its class's rate, and `full_price_usd` the same kWh at the slot's price."""
+    rows, total, full = [], 0.0, 0.0
+    keep = keeps() if MARKET else None
     caps = caps or {}
     part = {str(k): float(v) for k, v in (share or {}).items()}
     lim = {str(k): float(v) for k, v in (capped or {}).items()}
@@ -172,9 +262,13 @@ def deg_settle(slots: list[dict[str, Any]], offered: dict[int, float], meters: d
         penalty = clamp0(off - delivered) * hours * s.get("penalty", 0.0)
         if MARKET:                                 # paid for what was delivered: no cap at the promise, no penalty
             delivered = sum(p[0].get(str(i), 0.0) for p in per.values()) / hours
+            cut = lim[str(i)] / delivered if str(i) in lim and delivered > lim[str(i)] else 1.0     # each class by the same factor, as trim_called does
             delivered = k * (min(delivered, lim[str(i)]) if str(i) in lim else delivered)
             eligible = delivered
             pay = delivered * hours * s["price"]
+            full += pay
+            if keep is not None:                   # the nodes' part of the half hour, over what they're left of the bill
+                pay = k * cut * sum(p[1].get(str(i), 0.0) for p in per.values()) * s["price"] / (1.0 - keep)
             penalty = 0.0
         net = pay - penalty
         total += net
@@ -185,15 +279,16 @@ def deg_settle(slots: list[dict[str, Any]], offered: dict[int, float], meters: d
              {"role": "seller", "value": round(total, 4), "currency": currency}]
     return {"components": rows, "total": round(total, 4), "revenue_flows": flows,
             "net_zero_ok": abs(sum(f["value"] for f in flows)) < 1e-9,
-            "policy": "beckn/DEG specification/policies/demand-flex-contractpolicy.rego (ported)"}
+            "policy": policy_rule(), **({"full_price_usd": round(full, 4)} if MARKET else {})}
 
 
-def call_shares(paid_usd: float, by_home_kwh: dict[str, float], batt_kwh: dict[str, float], buildings: set[str]) -> dict[str, Any]:
+def call_shares(full_usd: float, by_home_kwh: dict[str, float], batt_kwh: dict[str, float], buildings: set[str], bill_usd: float | None = None) -> dict[str, Any]:
     """A call's payment on the price book: each node's kWh at the call's price, times its class's share, stored energy at the battery
-    share, a building at its own. The coordinator keeps the rest, as in the booking."""
+    share, a building at its own. full_usd: the call's kWh at its price. bill_usd: what its buyer pays (call_bill), and the coordinator keeps the difference, as in the booking."""
     b = price_book()["x"]
+    bill = full_usd if bill_usd is None else bill_usd
     kwh = sum(float(v) for v in by_home_kwh.values())
-    rate = paid_usd / kwh if kwh > 0 else 0.0
+    rate = full_usd / kwh if kwh > 0 else 0.0
     per = {}
     for h, v in by_home_kwh.items():
         v = float(v)
@@ -202,14 +297,22 @@ def call_shares(paid_usd: float, by_home_kwh: dict[str, float], batt_kwh: dict[s
         else:
             s = min(v, clamp0(float(batt_kwh.get(h, 0.0))))
             per[h] = (s * float(b["home_battery"]) + (v - s) * float(b["home_other"])) * rate
+    per = within(per, bill)
     pool = sum(per.values())
-    return {"pool": round(pool, 4), "fee": round(paid_usd - pool, 4), "per_home": {h: round(v, 4) for h, v in per.items()},
-            "usd_per_kwh": round(rate, 4), "rule": "the call's price on what each node added, times its class's share (price_book.json)"}
+    return {"pool": round(pool, 4), "fee": round(bill - pool, 4), "per_home": {h: round(v, 4) for h, v in per.items()},
+            "usd_per_kwh": round(rate, 4), "rule": f"the call's price on what each node added, times its class's share. {keep_words()} (price_book.json)"}
+
+
+def call_bill(full_usd: float, by_home_kwh: dict[str, float], batt_kwh: dict[str, float], buildings: set[str]) -> float:
+    """What a call costs its buyer: what call_shares gives its nodes, over what they're left of the bill. So the keep holds even where a half hour's kWh went to no node."""
+    k = keeps()
+    return full_usd if k is None else round(call_shares(full_usd, by_home_kwh, batt_kwh, buildings)["pool"] / (1.0 - k), 4)
 
 
 def deposit_statement(total_usd: float, held_usd: float) -> dict[str, float]:
-    """A buyer's deposit against its bill. It held tentative power, so it counts toward what the buyer owes. If the bill is smaller
-    the rest goes back. The sellers' money doesn't change: they are paid on what was delivered."""
+    """A buyer's deposit against its bill. It held tentative power, so it counts toward what the buyer owes. If the bill is smaller the rest goes back: credited and refunded
+    always add up to what was held. The sellers' money doesn't change: they are paid on what was delivered. A deposit is set at the order's price and a bill at each class's
+    rate, so on a poor delivery of cheap kWh it can pass the bill, and then nothing is due."""
     held = clamp0(float(held_usd))
     used = min(held, clamp0(float(total_usd)))
     return {"held_usd": round(held, 4), "credited_usd": round(used, 4), "refund_usd": round(held - used, 4),

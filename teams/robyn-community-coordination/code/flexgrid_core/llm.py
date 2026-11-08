@@ -39,8 +39,9 @@ class LLM:
         self.model: str | None = None
         self.label = label
         # Qwen3.8 without thinking: temperature 0.7, top_p 0.8, top_k 20 (the model card); decisions a little cooler
-        self.decide_options = {"temperature": 0.3, "top_p": 0.8, "top_k": 20, "num_predict": 400, "num_ctx": NUM_CTX,
-                               **(decide_options or {})}
+        from .node.arm import model_options          # the run's temperature and seed, if its config sets them
+        self.decide_options = model_options({"temperature": 0.3, "top_p": 0.8, "top_k": 20, "num_predict": 400, "num_ctx": NUM_CTX,
+                                             **(decide_options or {})})
         self.chat_options = {"temperature": 0.7, "top_p": 0.8, "top_k": 20, "presence_penalty": 1.5, "num_predict": 600,
                              "num_ctx": NUM_CTX, **(chat_options or {})}
         self.retry_down_s = retry_down_s

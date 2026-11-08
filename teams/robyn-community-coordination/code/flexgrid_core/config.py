@@ -94,7 +94,7 @@ DEFAULTS: dict[str, Any] = {
     "clear_margin": 0.10,                # homes are asked for 10 % more than the community promises the utility (the
                                          # coordinator's AI agent picks 5-30 % per event when llm_enabled)
     "clear_lead_minutes": 180,           # clear at the latest this long before the utility's commit deadline
-    "coordinator_fee_share": 0.0,        # share of the event revenue the coordinator keeps (0 in the demo)
+    "coordinator_fee_share": 0.0,        # the old rules only: share of the event revenue the coordinator keeps. Under the 2026 rules it keeps the price book's coordinator_keeps of the bill (settlement.py)
     "send_workers": 8,                   # parallel Town sends when the coordinator broadcasts to 100 homes
     "inbox_workers": 4,                  # coordinator threads claiming from its Town inbox (bursts of ~100 messages)
     "catchup_workers": 16,               # ...at least this many, so a backlog after downtime clears faster

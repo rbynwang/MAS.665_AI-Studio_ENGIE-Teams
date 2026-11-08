@@ -11,17 +11,17 @@ from __future__ import annotations
 
 from typing import Any
 
-from . import beckn, config, signing
+from . import beckn
 from .utility import Utility
 
 
 class StandInBuyer(Utility):
+    CLASS_RATES = True                                  # the desk pays a pool's call by class, so a call is billed by class too
+
     def __init__(self, name: str = "utility"):
-        super().__init__()
+        super().__init__(f"{name}.key")
         self.name = name
         if name != "utility":
-            self.key = signing.load_or_create(config.CONFIG_DIR / "secrets" / f"{name}.key")
-            self.pub = signing.public_hex(self.key)
             self.ORDER_PREFIX = f"{name}-need-"
             self.PARTICIPANT = f"{name}-stand-in"
         # the program's days stay out of every baseline, whether or not this buyer orders on them

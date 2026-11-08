@@ -721,7 +721,7 @@
    "category": "common",
    "model_view": {
     "description": "Does nothing this step. Use when no tool is needed, a Not when line fits the situation, an alarm is active, or the device has nothing to give.",
-    "example": "no_action(reason=\"0 kW owed\")",
+    "example": "no_action(reason=\"nothing needs doing\")",
     "parameters": [
      {
       "name": "reason",

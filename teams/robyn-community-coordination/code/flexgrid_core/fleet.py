@@ -16,8 +16,9 @@ and when something leaves its limits. It runs on the node's own thread (Thinker)
     is the tunnel to the brain queue in front of it (node/queue.py). Each request says which node asks, because they all
     reach the queue through one tunnel from one address.
   * Each decision goes to that node's chained log (node/record.py), under the config folder's state/decisions.
-  * A node's answer can wait on the model far past Town's 30 s lease, so Town hands the message out again: a repeat is only
-    acknowledged (Fleet._repeat), because repeating a message must change nothing.
+  * A node's answer can wait on the model far past Town's 30 s lease, so Town hands the message out again. A copy of a message
+    it's still working on is left alone and one it finished is only acknowledged (Fleet._repeat): repeating a message must change
+    nothing, and Town hears a message was done only when it was.
   * If the model is down the agent falls back to code by itself (node/agent.py), and the rule-based homes never ask it.
 
 Memory: cfg lean_pack (or $FLEXGRID_PACK_DIR) reads the year from a pack (lean.py), which takes the fleet from 6.8 GB to 0.5,
@@ -35,6 +36,7 @@ import inspect
 import itertools
 import json
 import logging
+import math
 import os
 import resource
 import sys
@@ -42,11 +44,12 @@ import threading
 import time
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
+from datetime import datetime
 from typing import Any, Callable
 
 import httpx
 
-from . import config, replay as replay_mod, signing
+from . import config, doors, keep, replay as replay_mod, rt_control, signing
 from .adapters.simulated import SimulatedHome
 from .home_v2 import HomeV2
 from .node import record
@@ -57,6 +60,8 @@ from .town import TownSession
 log = logging.getLogger("flexgrid-fleet")
 KEEP_DECISIONS = 300           # what the status API keeps of a thinking node's decisions (all of them go to the file)
 KEEP_SEEN = 512                # message ids a node remembers, so a repeat from Town changes nothing
+TEXT_MAX = 400                 # the longest text an override may carry: the coordinator's own limit on a note
+UNREAD = "the node's alarm file can't be read"
 RETRY_S = (5.0, 15.0, 45.0, 120.0, 300.0)   # a batch of readings goes once, after the window: these waits outlast a dropped tunnel
 
 
@@ -246,6 +251,7 @@ class Thinker(threading.Thread):
         self.done: str | None = None
         self.wake = threading.Event()
         self.skipped = 0
+        self.running = False                  # taking its mail or stepping: the clock waits for it (cfg clock_waits)
 
     def post(self, msg: dict[str, Any]) -> None:
         self.mail.append(msg)
@@ -262,17 +268,27 @@ class Thinker(threading.Thread):
         while True:
             self.wake.wait()
             self.wake.clear()
-            while self.mail:
-                self.fleet.take(self.node, self.mail.popleft())
-            ts = self.want
-            if ts and ts != self.done:
-                self.done = ts
-                self.fleet.agent_step(self.node, ts)
+            self.running = True
+            try:
+                while self.mail:
+                    self.fleet.take(self.node, self.mail.popleft())
+                ts = self.want
+                if ts and ts != self.done:
+                    self.done = ts
+                    self.fleet.agent_step(self.node, ts)
+            finally:
+                self.running = False
+
+    def busy(self) -> bool:
+        """Still at work on what it was given: mail, or a step it hasn't finished."""
+        return self.running or bool(self.mail) or bool(self.want and self.want != self.done)
 
 
 class Fleet:
     kind = "homes"
     port_key, default_port, log_file = "fleet_port", 7872, "fleet.log"
+    keep: Any = None                                      # keep.for_fleet: live only
+    alarm_unsaved: dict[str, dict[str, Any]] = {}         # node -> what's waiting for the disk beside its alarm. Its own dict in __init__
 
     def __init__(self, limit: int | None = None):
         self.cfg = c = config.load()
@@ -289,11 +305,17 @@ class Fleet:
         self.events = deque(maxlen=500)
         self.town_in: deque = deque(maxlen=4000)        # s from the sender making a message to a fleet home claiming it
         self.checks = self.claims = 0                     # Town notify checks and claims made (polling load on Town)
-        self.seen: dict[str, dict[str, None]] = {}        # node -> the message ids it has taken, oldest first
-        self.repeats = 0                                  # messages Town handed out again, acknowledged and not acted on
+        self.seen: dict[str, dict[str, str]] = {}         # node -> the message ids it has finished, oldest first, and the status each came to. keep.py saves this
+        self.taking: dict[str, dict[str, str]] = {}       # node -> the message ids it's still working on, and the fence of the last hand-out. Never saved: a process that dies drops them, so Town hands them out again and they run
+        self.mail_lock = threading.Lock()                 # the poll thread and a thinker both move ids between those two
+        self.repeats = 0                                  # messages Town handed out again and nobody acted on
+        self.dropped = 0                                  # messages Town refused because their id held another message: /health shows it
+        self.alarm_unsaved = {}
         self.kept = set(c.get("kept_days") or ())         # days a node doesn't step on: cfg kept_days, the benchmark's
         self.kept_passes = 0
         self.started = time.time()
+        self.ready = False                                # the first pass over the nodes is over. Until then a reset waits on each node in turn: on 7 Nov the first pass took 166.6 s at full size,
+                                                          # and two starts lost /demo/start's 20 s call to the fleet. /health says it, and the coordinator's start and the deploy wait for it
         self.pool = ThreadPoolExecutor(max_workers=int(c.get("send_workers", 8)))
         self.homes: dict[str, HomeV2] = {}
         self.towns: dict[str, TownSession] = {}
@@ -302,6 +324,7 @@ class Fleet:
         self.tick_s: deque = deque(maxlen=120)           # how long each pass over the nodes took, s
         self.tick_worst = 0.0                             # a sale's steps solve every home's plan: this must stay under a step
         self.busy_passes = 0                              # a node skipped in a pass because it was busy: it catches up next pass
+        self.ticked: str | None = None                    # the step every node ticked at in the last whole pass: what the conductor waits for (cfg clock_waits)
         self.keydir = config.CONFIG_DIR / "fleet" / "keys"
         self.keydir.mkdir(parents=True, exist_ok=True)
         # one client for every session: each client holds a TLS context of its own
@@ -315,7 +338,9 @@ class Fleet:
             self.homes[name] = self.make_node(h, lambda to, k, body, mid, t=town: self._send(t, to, k, body, mid))
         # thinking nodes
         self.mind: Mind | None = None
+        self.damaged: list[tuple[str, str]] = []          # records read here that couldn't be used: keep.for_fleet makes each one an alarm
         self.agents: dict[str, Any] = {}
+        self.channels: dict[str, Any] = {}                # a person's channel to each node, made on first use
         self.thinkers: dict[str, Thinker] = {}
         self.decisions: dict[str, deque] = {}
         self.logs: dict[str, Any] = {}
@@ -325,10 +350,17 @@ class Fleet:
             self.mind.day_of = lambda n: self.homes[n].now_ts()[:10]
             self.version = record.model_version(self.mind.brain.model, self.mind.brain.url)
             for name in think:
-                self.decisions[name] = deque(maxlen=KEEP_DECISIONS)
-                self.logs[name] = record.Log(name, config.state_dir() / "decisions" / f"{name}.jsonl")
-                self.attach_agent(name)
-                self.thinkers[name] = Thinker(self, name)
+                try:
+                    self.decisions[name] = deque(maxlen=KEEP_DECISIONS)
+                    self.logs[name] = record.Log(name, config.state_dir() / "decisions" / f"{name}.jsonl")
+                    self.attach_agent(name)
+                    self.thinkers[name] = Thinker(self, name)
+                except Exception as exc:                  # noqa: BLE001  one node's damaged record must not stop the other 199. It runs on code, as a node with no agent does, and that's an alarm
+                    log.exception("%s agent", name)
+                    self.damaged.append((f"decisions/{name}", f"{type(exc).__name__}: {str(exc)[:120]}"))
+                    self.homes[name].agent = self.homes[name].brain = None
+                    for held in (self.decisions, self.logs, self.agents):
+                        held.pop(name, None)
             log.info("%d thinking nodes on %s: %s", len(self.thinkers), self.mind.brain.url, sorted(self.thinkers))
 
     # ------------------------------------------------------------------ what differs from the buildings
@@ -397,11 +429,12 @@ class Fleet:
     # ------------------------------------------------------------------ thinking nodes
     def attach_agent(self, name: str) -> None:
         """A new run starts each agent afresh: what it planned last time means nothing now. Its log goes on."""
+        from .node import loans
         from .node import tools as T
-        from .node.agent import OPTIONS
+        loans.DESK.node_lock = self.locks.__getitem__      # a loan touches another node's state, so it takes that node's lock
         lock, log_ = self.locks[name], self.logs[name]
         brain = NodeBrain(self.mind, lock, name)
-        brain.agent = self.agents[name] = self.make_agent(name, record.RecordingBrain(brain, log_, T.PROMPT_VERSION, self.version, OPTIONS), self._recorder(name))
+        brain.agent = self.agents[name] = self.make_agent(name, record.RecordingBrain(brain, log_, T.PROMPT_VERSION, self.version, self.mind.brain.options), self._recorder(name))
         self.homes[name].brain = self.make_mind(name, RecordedBackend(NodeBackend(self.mind, lock, name), log_))
 
     def _recorder(self, name: str) -> Callable[[dict[str, Any]], None]:
@@ -420,27 +453,35 @@ class Fleet:
             except Exception as exc:                      # the controller carries on without the agent
                 log.exception("%s agent step", name)
                 self.events.append({"at": time.time(), "home": name, "kind": "agent_error", "ts": ts, "error": str(exc)[:200]})
+            if self.keep is not None:                     # what a step did to the guard's day, a plant's one stop among it, is on disk before anything else happens
+                self.keep.node_done(name)
 
     def _send(self, town: TownSession, to: str, kind: str, body: dict[str, Any], mid: str) -> Future:
         """Sends go through a small pool so 200 homes reporting the same slot do not queue behind each other. The
         future tells the home whether the send went through: a meter reading is marked reported only then, and is
         sent again on the next tick if it failed (HomeV2._mark_reported). With two buyers each owns a copy of the meter, so
-        a reading goes to both, the same signed body, as tools/sim_event.py's bus does. Nobody sends a batch of readings or a second
-        buyer's copy again, so those retry here, under the same id: Town takes an id once."""
+        a reading goes to both, the same signed body, as tools/sim_event.py's bus does. Nobody sends anything else again by itself (live, 6 Nov 2026: about 2 % of
+        sends failed in bursts, and 1 to 7 offers of 203 were lost), so it retries here, under the same id: Town answers the same envelope as a replay."""
         buyers = self.cfg.get("buyers") or []
         m = body.get("message") or {}
 
         def run(dest: str, message_id: str, tries: int = 0):
             try:
-                return town.send(dest, kind, body, message_id)
+                out = town.send(dest, kind, body, message_id)
             except Exception as exc:
                 self.events.append({"at": time.time(), "home": town.name, "kind": "send_error", "to": dest,
                                     "message_kind": kind, "error": str(exc)[:200]})
-                if ("batch" in m or dest != to) and tries < len(RETRY_S):
+                log.warning("%s: %s to %s failed, try %d: %s", town.name, kind, dest, tries + 1, str(exc)[:160])
+                if ("performance" not in m or dest != to) and tries < len(RETRY_S):
                     t = threading.Timer(RETRY_S[tries], lambda: self.pool.submit(run, dest, message_id, tries + 1))
                     t.daemon = True
                     t.start()
                 raise
+            if isinstance(out, dict) and out.get("duplicate"):     # a retry here is the same envelope, which Town answers as a replay: this one went nowhere
+                self.dropped += 1
+                self.events.append({"at": time.time(), "home": town.name, "kind": "send_dropped", "to": dest, "message_kind": kind, "message_id": message_id})
+                log.error("Town refused %s from %s to %s: id %s holds another message", kind, town.name, dest, message_id)
+            return out
         if to in buyers and ("performance" in m or "batch" in m):
             for b in buyers:
                 if b != to:
@@ -469,7 +510,7 @@ class Fleet:
                 continue
             r = h.replay
             r.configure(kw.get("start", r.start), float(kw.get("step_seconds", r.step_seconds)),
-                        int(kw.get("loop_days", r.loop_days)), kw.get("at"), kw.get("at_wall"))
+                        int(kw.get("loop_days", r.loop_days)), kw.get("at"), kw.get("at_wall"), hold=bool(kw.get("hold")))
             if not kw.get("keep"):        # a new run starts each home afresh; a change of speed (keep) goes on with it
                 h.adapter.idx = None
             out = r.clock()
@@ -480,18 +521,90 @@ class Fleet:
             if only and name != only:
                 continue
             with self.locks[name]:
-                h.reset()
+                h.reset()                                 # its play too: nothing it sends in the new run names a message of the last one
+                self.channels.pop(name, None)
                 if hasattr(h, "outbox"):                              # QuietNode: last run's readings don't go out in this one
                     h.outbox.held.clear()
                     h.outbox.first = None
                 if name in self.thinkers:
-                    if self.agents[name].sim.levers is not None:      # stopped mid-sale: the devices go back to their own day
-                        self.agents[name].close()
                     self.attach_agent(name)
                     self.thinkers[name].want = self.thinkers[name].done = None
                     ctx = getattr(self.agents[name], "ctx", None)
                     if ctx is not None:                       # the same days again: its log must not answer "done already"
-                        ctx.new_run()
+                        ctx.new_run(keep_alarm=True)          # this door is unsigned, so an alarm stays on through it
+
+    def person_word(self, name: str, msg: Any) -> dict[str, Any]:
+        """A person's signed word: the one way an alarm ends on a live node, and the one way a limit goes up. cfg person_keys names each role's public key. With none on file nothing passes here."""
+        keys = self.cfg.get("person_keys") or {}
+        if not keys:
+            return {"status": "blocked", "why": "No person's key is on file here."}
+        with self.locks[name]:
+            ch = self.channels.get(name)
+            if ch is None:
+                ctx = getattr(self.agents.get(name), "ctx", None)
+                seq, save = doors.numbers(name, keys.values()), lambda n: doors.note(name, seq=n)
+                ch = self.channels[name] = ctx.owner_channel(keys, seq, save) if ctx is not None else code_channel(self.homes[name], self.kind, keys, seq, save)
+            out = ch.receive(msg)
+            if out.get("status") == "done":
+                self.alarm_kept(name, **doors.limit_said(name, msg))
+            return out
+
+    def alarm_kept(self, name: str, **more: Any) -> None:
+        """What the node's overrides say of an alarm, on disk before anyone hears it was taken. keep.py's pass is up to 5 s behind and its files go with their run or their age, and
+        an alarm must do neither. A disk that won't take it doesn't stop the alarm: it stands in memory, /health says so, and each pass of the tick tries again."""
+        ov = self.homes[name].adapter.overrides
+        more = {**self.alarm_unsaved.get(name, {}), **more}
+        try:
+            doors.note(name, hold=ov.get("alarm_hold"), signal=ov.get("alarm"), **more)
+            self.alarm_unsaved.pop(name, None)
+        except OSError as exc:
+            if name not in self.alarm_unsaved:
+                log.error("%s: an alarm isn't reaching the disk: %s", name, exc)
+                self.events.append({"at": time.time(), "home": name, "kind": "alarm_not_saved", "error": str(exc)[:160]})
+            self.alarm_unsaved[name] = more
+
+    def person_back(self, keeper: Any) -> None:
+        """After keep.py has put the nodes back, and before any tick: a state file can be older than an alarm or a person's limit, or gone, so it has no say in them. The node's own file
+        has, and once that exists it's the whole truth, or a state file from just before a person's word would hold the node again. With no file yet the state still counts: it's how an
+        alarm from older code comes across. A thinking node's log counts as well, because it's on disk at once. A file that can't be read may have held an alarm, so the node stays held
+        until a person says. Whatever is wrong with one node, the others come back and the service starts."""
+        for name, h in self.homes.items():
+            if not hasattr(h.adapter, "overrides"):
+                continue
+            try:
+                self._person_back(name, h.adapter, keeper)
+            except Exception as exc:                      # noqa: BLE001
+                log.exception("%s: what a person said didn't come back", name)
+                keeper.bad.append(f"person/{name}")
+                keeper.event("state_set_aside", file=f"person/{name}", why=f"{type(exc).__name__}: {str(exc)[:120]}")
+                h.adapter.hold_alarm(UNREAD)
+
+    def _person_back(self, name: str, a: Any, keeper: Any) -> None:
+        ctx = getattr(self.agents.get(name), "ctx", None)
+        b = doors.book(name)
+        if b and "bad" in b:
+            keeper.bad.append(f"person/{name}")
+            keeper.event("state_set_aside", file=f"person/{name}", why=b["bad"])
+            hold, signal = UNREAD, None
+        elif b is None:
+            hold, signal = a.overrides.get("alarm_hold"), a.overrides.get("alarm")
+        else:
+            hold, signal = b.get("hold"), b.get("signal")
+        hold = hold or getattr(ctx, "stopped", None)
+        if hold:
+            a.overrides.pop("alarm", None)
+            if ctx is not None:
+                ctx.alarm(hold)
+            a.hold_alarm(hold)
+            if signal:
+                a.overrides["alarm"] = signal
+            self.alarm_kept(name)
+        elif "alarm_hold" in a.overrides:                 # the state is older than a person's word
+            for k in ("alarm", "alarm_hold", "stop"):
+                a.overrides.pop(k, None)
+        for group, limits in ((b or {}).get("limits") or {}).items():
+            for k, v in limits.items():
+                rt_control.write_limit(a, group, k, v)
 
     def held(self) -> bool:
         """cfg kept_days: the days the benchmark keeps unseen. The clock runs on after a debug day, and the nodes don't step into one.
@@ -504,12 +617,15 @@ class Fleet:
             t0 = time.time()
             if self.held():
                 self.kept_passes += 1
+                self.ready = True                         # no node steps on a kept day, so there's no pass to wait for
                 time.sleep(1.0)
                 continue
+            whole = True
             for name, h in list(self.homes.items()):
                 lock = self.locks[name]
                 if not lock.try_enter():
                     self.busy_passes += 1
+                    whole = False
                     continue
                 try:
                     h.tick()
@@ -520,6 +636,11 @@ class Fleet:
                 th = self.thinkers.get(name)
                 if th is not None:
                     th.offer((h.adapter.tel or {}).get("ts"))
+            for name in list(self.alarm_unsaved):
+                self.alarm_kept(name)
+            seen = {(h.adapter.tel or {}).get("ts") for h in self.homes.values()}
+            self.ticked = next(iter(seen)) if whole and len(seen) == 1 else None
+            self.ready = True
             d = round(time.time() - t0, 3)
             self.tick_s.append(d)
             self.tick_worst = max(self.tick_worst, d)
@@ -530,30 +651,48 @@ class Fleet:
         town, h = self.towns[name], self.homes[name]
         with self.locks[name]:
             try:
-                note, status = h.handle(msg.get("kind", ""), msg.get("from"), msg.get("body") or {}), "processed"
+                note = h.handle(msg.get("kind", ""), msg.get("from"), msg.get("body") or {})
             except Exception as exc:
-                note, status = f"error: {exc}", "rejected"
+                note = beckn.Refused(f"error: {exc}")
                 log.exception("%s handle", name)
+            status, said = beckn.ack_of(note)
+            fence = self._done(name, msg, status)         # a repeat of it says the same: _repeat
+            if self.keep is not None:                     # on disk before Town hears it: if this process dies here, Town hands the message out again
+                self.keep.node_done(name)
         try:
-            town.ack(msg["message_id"], msg["fence"], status, {"note": str(note)[:200]})
+            town.ack(msg["message_id"], fence, status, said)
         except Exception as exc:                          # Town hands it out again after its lease; the answer is kept
             self.events.append({"at": time.time(), "home": name, "kind": "town_error", "error": f"ack: {str(exc)[:160]}"})
 
-    def _repeat(self, name: str, msg: dict[str, Any]) -> bool:
-        """True for a message this node has already taken. Town delivers at least once, and hands a message out again when its lease
-        runs out. A thinking node acknowledges only after the model answers, so that is usual here: on real Qwen a commitment was answered
-        twice, and an rt_dispatch handled twice would add its kW twice. The copy is acknowledged with its new fence, so Town stops."""
-        seen, mid = self.seen.setdefault(name, {}), msg.get("message_id")
-        if mid not in seen:
-            seen[mid] = None
+    def _done(self, name: str, msg: dict[str, Any], status: str) -> str:
+        """This message is finished: it's seen now, and not before. Returns the fence of its last hand-out, the one Town will take an ack on."""
+        mid = msg["message_id"]
+        with self.mail_lock:
+            seen = self.seen.setdefault(name, {})
+            seen[mid] = status
             if len(seen) > KEEP_SEEN:
                 seen.pop(next(iter(seen)))
-            return False
-        self.repeats += 1
-        try:
-            self.towns[name].ack(mid, msg["fence"], "processed", {"note": "a repeat: already taken"})
-        except Exception as exc:                          # it comes back once more, and is acknowledged then
-            self.events.append({"at": time.time(), "home": name, "kind": "town_error", "error": f"ack: {str(exc)[:160]}"})
+            return self.taking.setdefault(name, {}).pop(mid, None) or msg.get("fence")
+
+    def _repeat(self, name: str, msg: dict[str, Any]) -> bool:
+        """True for a message that is not to be acted on now. Town delivers at least once, and hands a message out again when its lease runs out. A thinking node finishes a message
+        only after the model answers, so that is usual here: on real Qwen a commitment was answered twice, and an rt_dispatch handled twice would add its kW twice.
+        Finished, the copy is acknowledged with its new fence, so Town stops. It says what the first one came to, so a message refused and handed out again is on Town's record as refused.
+        Still in the mail, it's left alone. Town keeps it until the work is done, because a kill here would lose the mail, and only this new fence can acknowledge it then."""
+        mid = msg.get("message_id")
+        with self.mail_lock:
+            seen, taking = self.seen.setdefault(name, {}), self.taking.setdefault(name, {})
+            done, working, said = mid in seen, mid in taking, seen.get(mid)
+            if not done:
+                taking[mid] = msg.get("fence")
+            if not done and not working:
+                return False
+            self.repeats += 1
+        if done:
+            try:
+                self.towns[name].ack(mid, msg["fence"], said or "processed", {"note": "a repeat: already taken"})
+            except Exception as exc:                      # it comes back once more, and is acknowledged then
+                self.events.append({"at": time.time(), "home": name, "kind": "town_error", "error": f"ack: {str(exc)[:160]}"})
         return True
 
     def _drain(self, name: str) -> int:
@@ -576,6 +715,8 @@ class Fleet:
                 th.post(msg)
             else:
                 self.take(name, msg)
+                if msg["message_id"] in self.taking.get(name, ()):      # a Fleet with its own take, as Town's track_seller.py has: back here, it's finished
+                    self._done(name, msg, "processed")
 
     def poll_loop(self, names: list[str]) -> None:
         """One worker polls a share of the homes' inboxes in turn (a quick, non-blocking check each), instead of 200
@@ -586,7 +727,9 @@ class Fleet:
         offers are due 6 replay hours later), and an idle fleet of 200 costs Town 13 checks a second."""
         every = float(self.cfg.get("fleet_poll_seconds", 5.0))
         idle = float(self.cfg.get("fleet_poll_idle_seconds", 15.0))
+        sweep = float(self.cfg.get("fleet_sweep_seconds", 60.0))   # a hint is only a wake-up call: a claim pass this often anyway, as InboxPoller's sweep
         last_mail = dict.fromkeys(names, 0.0)
+        swept = dict.fromkeys(names, 0.0)                          # 0: a first pass at once, for what came while this process was away
         due = {n: time.time() + k * idle / max(1, len(names)) for k, n in enumerate(names)}   # spread the checks
         while True:
             t0 = time.time()
@@ -595,10 +738,14 @@ class Fleet:
                     continue
                 try:
                     self.checks += 1
-                    if self.towns[name].notify(wait=0):
+                    # Town keeps a message until it's acknowledged, but it wakes a receiver once. Waiting for a hint alone left a message whose hint was lost, or
+                    # one handed out again after a claim that was never acknowledged (a node that died), in the inbox until the next message came
+                    if self.towns[name].notify(wait=0) or t0 - swept[name] >= sweep:
+                        swept[name] = t0
                         if self._drain(name):
                             last_mail[name] = time.time()
                 except Exception as exc:
+                    swept[name] = 0.0                              # the check may have used up a hint: a pass on the next round
                     self.events.append({"at": time.time(), "home": name, "kind": "town_error", "error": str(exc)[:200]})
                 due[name] = time.time() + (every if time.time() - last_mail[name] < 60.0 else idle)
             time.sleep(max(0.2, min(due.values()) - time.time()))
@@ -692,6 +839,28 @@ def lean_stats() -> dict[str, Any]:
     return lean.stats()
 
 
+def code_channel(h: Any, kind: str, keys: dict[str, str], seq: dict[str, int] | None = None, save: Callable[[dict[str, int]], Any] | None = None) -> Any:
+    """A person's channel on a node with no agent: an alarm's end, and a limit, which the controller holds by itself. Closing a group isn't here. Without levers the controller
+    uses every device it has, and an offer would go on counting what a person closed, so a closed group needs an agent."""
+    from .node import policy as P
+
+    def apply(verb: str, group: str, name: str, value: float | None) -> dict[str, Any]:
+        ov = h.adapter.overrides
+        if verb == "set_limit":
+            rt_control.write_limit(h.adapter, group, name, value)
+            return {"status": "done"}
+        if verb != "clear_alarm":
+            return {"status": "blocked", "why": "This node has no agent, so it takes a limit or an alarm's end, and nothing else yet."}
+        if ov.get("alarm"):
+            return {"status": "blocked", "why": "The alarm is still on."}
+        if "alarm_hold" not in ov:
+            return {"status": "blocked", "why": "No alarm is holding this node."}
+        ov.pop("alarm_hold")
+        h.adapter.rt_override("stop", False)
+        return {"status": "done"}
+    return P.OwnerChannel(h.name, P.Policy("building" if kind == "buildings" else "home"), keys, apply, h.log, seq, save)
+
+
 def comfort_ok(value: Any) -> bool:
     """A comfort limit from outside, inside the range policy.py gives a person. The controller takes these numbers as they come, and this
     door isn't the signed owner channel, so nothing here may go past that range or carry another name."""
@@ -700,10 +869,40 @@ def comfort_ok(value: Any) -> bool:
     return isinstance(value, dict) and bool(value) and all(k in rng and isinstance(v, (int, float)) and not isinstance(v, bool) and rng[k][0] <= v <= rng[k][1] for k, v in value.items())
 
 
+def raises_a_limit(a: Any, kind: str, value: Any) -> bool:
+    """Would this value take a person's limit up? A limit goes up only by that person's signed word, because the guard trusts this number. This door may only bring one down, token
+    or no token: what's lower can't hurt anyone, and a clear goes back to what the file or a signed word says."""
+    if kind == "comfort" and getattr(a, "ctl", None) is not None:
+        return any(float(v) > rt_control.person_limit(a, k) for k, v in value.items())
+    return kind == "lights" and float(value) > a.light_limit()
+
+
+def plain(value: Any) -> bool:
+    """Plain text someone might say: a signal's name, a note. Not empty, and short enough to go on the record."""
+    return isinstance(value, str) and bool(value.strip()) and len(value) <= TEXT_MAX
+
+
+def override_ok(kind: str, value: Any) -> bool:
+    """What each override may carry through this door. A switch is true or plain text, and false or null to end it. Anything else is refused and changes nothing,
+    so what reaches rt_override means what it says. What freed an alarm was a value that was neither: "", [] or {}."""
+    if kind == "comfort":
+        return comfort_ok(value)
+    if kind == "lights":
+        return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+    if kind == "note":
+        return value is None or value is False or plain(value)
+    if kind == "depart_at":
+        try:
+            return plain(value) and bool(datetime.strptime(value, "%Y-%m-%d %H:%M"))
+        except ValueError:
+            return False
+    return value is None or isinstance(value, bool) or plain(value)
+
+
 def build_app(f: Fleet):
     from fastapi import Body, FastAPI, HTTPException
 
-    app = FastAPI(title="flexgrid-fleet", version="0.3.0")
+    app = FastAPI(title="flexgrid-fleet", version="0.3.0", dependencies=[doors.door()])
 
     @app.get("/health")
     def health():
@@ -711,15 +910,20 @@ def build_app(f: Fleet):
         v = sorted(f.town_in)
         q = (lambda p: round(v[min(len(v) - 1, int(round(p * (len(v) - 1))))], 2)) if v else None   # noqa: E731
         ticks = sorted(f.tick_s)
-        out = {"ok": True, "kind": f.kind, "homes": len(f.homes), "clock": any_home.replay.clock() if any_home else None,
+        out = {"ok": True, "ready": f.ready, "kind": f.kind, "homes": len(f.homes), "clock": any_home.replay.clock() if any_home else None,
                "town_delivery_s": {"n": len(v), "p50": q(0.5), "p95": q(0.95), "max": round(v[-1], 2)} if v else {"n": 0},
                "town_calls": {"notify": f.checks, "claim": f.claims,
                               "uptime_s": round(time.time() - f.started)},
                "memory": memory_mb(), "pack": f.lean, "rows": lean_stats() if f.lean else None, "tick_s": {"p50": ticks[len(ticks) // 2], "max": ticks[-1], "worst": f.tick_worst} if ticks else None, "busy_passes": f.busy_passes,
-               "repeats": f.repeats, "kept_passes": f.kept_passes, "thinking": sorted(f.thinkers), "model": f.mind.status() if f.mind else None}
+               "repeats": f.repeats, "dropped": f.dropped, "kept_passes": f.kept_passes, "thinking": sorted(f.thinkers), "model": f.mind.status() if f.mind else None, "doors": doors.state()}
         if f.kind == "buildings":
             out["agent"] = "ready" if BuildingFleet.agent_class() else "missing: flexgrid_core/node/building_agent.py, so the buildings run on code"
-        return out
+        out["held"] = keep.held(f)                                                                                                                  # who waits for a person's word
+        out["person_keys"] = sorted(f.cfg.get("person_keys") or ())                                                                                 # whose word can end it
+        kept = keep.health(f.keep)
+        if f.alarm_unsaved:
+            kept = {**kept, "ok": False, "alarms": [*kept.get("alarms", ()), {"what": "alarm_not_saved", "why": f"{len(f.alarm_unsaved)} nodes' alarms aren't on disk, so a restart would lose them", "since": None}]}
+        return {**out, **kept}
 
     @app.get("/homes")
     def homes():
@@ -763,8 +967,23 @@ def build_app(f: Fleet):
         for n, a in f.agents.items():
             th = f.thinkers.get(n)
             out[n] = {"steps": [list(s) for s in a.steps[-12:]], "calls_running": len(a.calls), "levers": a.sim.levers, "decisions": len(f.decisions.get(n) or ()),
-                      "reports": len(a.reports), "steps_skipped": th.skipped if th else 0}
-        return {"model": f.mind.status() if f.mind else None, "nodes": out}
+                      "reports": len(a.reports), "steps_skipped": th.skipped if th else 0,
+                      "fallbacks": dict(getattr(a, "fallbacks", {})) | dict(getattr(f.homes[n].brain, "fallbacks", None) or {}),
+                      "flags": dict(getattr(a, "flags", {})), "receipts": len(getattr(a, "receipts", ())), "told": len(getattr(a, "told", ()))}
+        any_home = next(iter(f.homes.values()), None)
+        busy = sorted(n for n, th in f.thinkers.items() if th.busy()) + sorted(n for n, ids in f.taking.items() if ids and n not in f.thinkers)
+        return {"model": f.mind.status() if f.mind else None, "nodes": out,
+                "clock": {"now": any_home.replay.ts(any_home.replay.current()) if any_home else None, "held": bool(any_home and any_home.replay.held),
+                          "ticked": f.ticked, "busy": busy}}
+
+    @app.get("/agents/{name}/receipts")
+    def agent_receipts(name: str):
+        """Every node an agent: each decision's receipt, and what the owner or manager was told (node/agent.py)."""
+        a = f.agents.get(name)
+        if a is None:
+            raise HTTPException(404, "this node has no agent")
+        return {"receipts": list(getattr(a, "receipts", ())), "told": list(getattr(a, "told", ())), "flags": dict(getattr(a, "flags", {})),
+                "fallbacks": dict(getattr(a, "fallbacks", {})) | dict(getattr(f.homes[name].brain, "fallbacks", None) or {})}
 
     @app.get("/agents/{name}/decisions")
     def agent_decisions(name: str, n: int = 50):
@@ -793,7 +1012,14 @@ def build_app(f: Fleet):
         for h in f.homes.values():
             h.adapter.set_battery_fault(False)
             if hasattr(h.adapter, "overrides"):
-                h.adapter.overrides.clear()
+                h.adapter.rt_override("clear")          # an alarm stays: this door has no signature
+
+    @app.post("/person/{name}")
+    def person_word(name: str, body: dict = Body(default={})):
+        """A person's signed word for one node (policy.signed): the end of an alarm, a limit, and on a node with an agent a group closed or opened. This is the door Fleet.person_word's docstring speaks of."""
+        if name not in f.homes:
+            raise HTTPException(404, "no such node here")
+        return f.person_word(name, body)
 
     @app.post("/demo/scenario")
     def demo_scenario(body: dict = Body(default={})):
@@ -808,23 +1034,47 @@ def build_app(f: Fleet):
             scenario_reset()
             out["reset"] = True
         w = body.get("weather")
-        if isinstance(w, dict):
-            to = beckn.add_minutes(now, 60 * float(w["hours"])) if w.get("hours") else None
-            out["weather"] = replay_mod.set_weather(w.get("pv"), w.get("load"), now, to=to, dT=w.get("dT"))
+        if isinstance(w, dict):                           # from now on, or from a step a test runner names ("from")
+            frm = str(w.get("from") or now)
+            to = beckn.add_minutes(frm, 60 * float(w["hours"])) if w.get("hours") else None
+            out["weather"] = replay_mod.set_weather(w.get("pv"), w.get("load"), frm, to=to, dT=w.get("dT"))
         ov = body.get("override")
         if isinstance(ov, dict):                          # an owner's wish (the Control Room, or the phone app)
             name, k = ov.get("home"), ov.get("kind")
-            kinds = ("comfort", "lights", "stop", "clear") if f.kind == "buildings" else ("ev_now", "comfort", "stop", "depart_at", "clear", "note")
-            if name not in f.homes or k not in kinds:
+            kinds = ("comfort", "lights", "stop", "clear", "alarm") if f.kind == "buildings" else ("ev_now", "comfort", "stop", "depart_at", "clear", "note", "alarm")
+            if not isinstance(name, str) or name not in f.homes or k not in kinds:
                 raise HTTPException(400, f"override: a node here and kind {'|'.join(kinds)}")
-            if k == "comfort" and not comfort_ok(ov.get("value", True)):
+            value = ov.get("value", "alarm" if k == "alarm" else True)
+            if k == "comfort" and not comfort_ok(value):
                 raise HTTPException(400, "override: comfort takes max_rise_c, max_rise_away_c or precool_c, inside policy.py's range")
+            if not override_ok(k, value):
+                raise HTTPException(400, f"override: {k} doesn't take that value. A switch is true, plain text, false or null")
             a = f.homes[name].adapter
             if not hasattr(a, "rt_override"):
                 raise HTTPException(409, f"{name} has no real-time control")
-            a.rt_override(k, ov.get("value", True))
-            f.homes[name].log("owner_override", override=k, value=ov.get("value", True), source=ov.get("source", "control room"))
+            if raises_a_limit(a, k, value):
+                raise HTTPException(403, f"override: a limit goes up only by a person's signed word, through POST /person/{name}")
+            # an alarm's input: {"kind": "alarm", "value": "smoke"}, and value false when the signal ends. Neither frees the node: only the signed door does that
+            a.rt_override(k, value)
+            if k == "alarm":
+                f.alarm_kept(name)
+            f.homes[name].log("owner_override", override=k, value=value, source=ov.get("source", "control room"))
             out["override"] = {"home": name, "kind": k, "overrides": dict(a.overrides), "mode": getattr(a, "mode", "fixed")}
+            if "alarm_hold" in a.overrides:
+                out["held"] = f"an alarm holds {name} until a person clears it through POST /person/{name}"
+        for k in ("closed", "zone_event"):                # a building closes for the day, or holds an event in a zone it sold (node/surprises.py)
+            sp = body.get(k)
+            if isinstance(sp, dict):
+                name = sp.get("home")
+                if f.kind != "buildings" or name not in f.homes:
+                    raise HTTPException(400, f"{k}: a building here")
+                from .node import surprises
+                h = f.homes[name]
+                t = str(sp.get("at") or now)              # now, or the step a test runner names: it posts while every clock waits one step before
+                with f.locks[name]:
+                    out.update(surprises.close_building(h, t, sp.get("share")) if k == "closed" else
+                               surprises.zone_event(h, t, float(sp.get("share", 0.25)), float(sp.get("hours", 3.5)), sp.get("space")))
+                h.log("what_if", what=k, **{x: v for x, v in sp.items() if x != "home"})
         bf = body.get("battery_fault")
         if isinstance(bf, dict):
             on = bool(bf.get("on", True))
@@ -841,6 +1091,11 @@ def build_app(f: Fleet):
         out["now"] = now
         return out
 
+    @app.get("/demo/clock")
+    def demo_clock_get():
+        any_home = next(iter(f.homes.values()), None)
+        return any_home.replay.clock() if any_home else {}
+
     @app.post("/demo/clock")
     def demo_clock(body: dict = Body(default={})):
         return f.configure_clock(**body)
@@ -855,7 +1110,7 @@ def build_app(f: Fleet):
         @app.get("/b/{name}/health")
         def b_health(name: str):
             h = node(name)
-            return {"ok": True, "agent": name, "adapter": "building", "town": True, "replay": {"now": h.replay.ts(h.replay.current())}, "memory": memory_mb()}
+            return {"ok": True, "ready": f.ready, "agent": name, "adapter": "building", "town": True, "replay": {"now": h.replay.ts(h.replay.current())}, "memory": memory_mb(), **keep.health(f.keep)}
 
         @app.get("/b/{name}/telemetry")
         def b_telemetry(name: str):
@@ -882,7 +1137,12 @@ def build_app(f: Fleet):
         def b_reset(name: str):
             node(name)
             f.reset(only=name)
+            replay_mod.set_weather(1.0, 1.0, dT=0.0)      # a what-if here is the process's: this is the only reset a run's start sends the buildings
             return {"ok": True, "home": name}
+
+        @app.get("/b/{name}/demo/clock")
+        def b_clock_get(name: str):
+            return node(name).replay.clock()
 
         @app.post("/b/{name}/demo/clock")
         def b_clock(name: str, body: dict = Body(default={})):
@@ -895,6 +1155,9 @@ def build_app(f: Fleet):
             ov = body.get("override")
             if isinstance(ov, dict):
                 body = {**body, "override": {**ov, "home": name}}
+            for k in ("closed", "zone_event"):
+                if isinstance(body.get(k), dict):
+                    body = {**body, k: {**body[k], "home": name}}
             return demo_scenario(body)
 
         @app.get("/b/{name}/logs/tail")
@@ -914,8 +1177,14 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
     logging.getLogger("httpx").setLevel(logging.WARNING)
     f = (BuildingFleet if a.buildings else Fleet)(a.limit)
+    if not f.cfg.get("person_keys"):
+        log.warning("no person's key is on file here, so nobody can end an alarm on these nodes: python -m flexgrid_core.doors says how")
+    keeper = keep.for_fleet(f)                            # each node comes back where it stopped, before its tick starts
     f.start()
-    uvicorn.run(build_app(f), host="127.0.0.1", port=int(f.cfg.get(f.port_key, f.default_port)), log_level="warning")
+    try:
+        uvicorn.run(build_app(f), host="127.0.0.1", port=int(f.cfg.get(f.port_key, f.default_port)), log_level="warning")
+    finally:
+        keeper.close()
 
 
 if __name__ == "__main__":

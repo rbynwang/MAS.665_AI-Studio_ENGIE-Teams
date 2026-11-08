@@ -1,4 +1,4 @@
-"""A home driven by the dataset replay: real 2023 solar and load, simulated battery and EV.
+"""A home driven by the dataset replay: simulated load, solar, battery and EV, on real weather. No real home or meter is behind it.
 
 Default mode is self-consumption (what a Powerwall or IQ Battery does out of the box): the battery covers the
 home's deficit and soaks up its solar surplus; the EV charges at full power from arrival (unmanaged, as in the
@@ -34,6 +34,7 @@ DONE_BY = {"dish": "23:30", "dryer": "22:45"}      # the owner's done-by times: 
 
 BACKUP = os.environ.get("FG_BATTERY_MODE") == "backup"   # benchmark: the battery is held for grid events
 SUB = 3                     # 5-minute parts of a 15-minute step (control_mode rolling)
+NOTES_WAITING = 4           # unread notes a newer one pushed aside, kept to be read: a person writing more than this before anyone reads them is the door's to stop
 
 
 class SimulatedHome:
@@ -95,10 +96,17 @@ class SimulatedHome:
         # the node agent's device tools (flexgrid_core/node): None = the controller may use every device. A dict = only what
         # the agent's calls opened, until they end: battery_kw, ev (the plan may pause the car), ev_kw (its floor), v2h_kw
         self.levers: dict[str, Any] | None = None
+        self.held_out: set[str] = set()      # with no levers, what a wish keeps out: a building's levers can't stand open all but a few (BuildingAgent.hold_out)
+        # the controller's writes don't go through the guard, so _clip holds them to the limit where they're written. The node's log takes these rows
+        self.clips: list[dict[str, Any]] = []
+        self.clip_at: dict[str, str] = {}                # the last step each limit stopped a write
+        self.reset_on: Any = None                        # the clock a reset found, until the new run's clock comes (rt_reset)
+        self.car_first = False                           # an owner's wish turned ev_now on, not a person: the wish's end turns it off. A person's own word takes it over
+        self.note_seen: str | None = None                # the door's note the node's agent has read, by owner.note_key: a newer one doesn't push it aside
 
     # --- physics -------------------------------------------------------------------
     def _caps(self, soc: float, dt: float = 0.25) -> tuple[float, float]:
-        P = self.P if self.levers is None else min(self.P, float(self.levers.get("battery_kw", 0.0)))
+        P = (0.0 if "battery" in self.held_out else self.P) if self.levers is None else min(self.P, float(self.levers.get("battery_kw", 0.0)))
         can_dis = max(0.0, min(P, (soc - self.R) * self.E * self.eta / dt))
         can_ch = max(0.0, min(self.P, self.P_ch, (self.SM - soc) * self.E / self.eta / dt))
         return can_dis, can_ch
@@ -261,11 +269,20 @@ class SimulatedHome:
             "source": "replay",
         }
         self.recent[i] = self.tel
-        if len(self.recent) > 400:
-            for k in sorted(self.recent)[:-384]:
+        if len(self.recent) > 400:                                  # by distance from this step: rows left ahead of a replay must go, not this run's own
+            for k in [k for k in self.recent if not i - 384 < k <= i]:
                 self.recent.pop(k, None)
 
     # --- the real-time design (control_mode "rolling") -------------------------------------------
+    def _clip(self, limit: str, ts: str, wanted: float, held_at: float) -> None:
+        """A write the limit stopped, for the record: one row when a limit starts to bite, not one every 5 minutes."""
+        if wanted <= held_at + 0.01:
+            return
+        last = self.clip_at.get(limit)
+        self.clip_at[limit] = ts
+        if last is None or self.replay.minutes_between(last, ts) > 15:
+            self.clips = (self.clips + [{"limit": limit, "at": ts, "wanted": round(wanted, 2), "held_at": round(held_at, 2)}])[-50:]
+
     def _sub_ts(self, ts: str, j: int) -> str:
         return rt_home.add_minutes(ts, j * 15 // SUB)
 
@@ -326,13 +343,16 @@ class SimulatedHome:
                 e = max(e, min(ev_dem, float(self.levers["ev_kw"])))     # a limit, not a pause: the agent's amps
             held_any = held_any or (ev_dem > 0 and e < ev_dem - 0.01)
             can_dis, can_ch = self._caps(self.soc, dt)
+            self._clip("battery_kw", ts, b, can_dis)
             b = max(-can_ch, min(can_dis, b))
             if h:
                 lo, hi = h.dq_bounds(ts)
                 u = max(lo, min(hi, u))
                 a = h.a(dt)
                 x_hi = lim.max_rise_c if occ0 else lim.max_rise_away_c
+                x_hi = min(x_hi, float((self.overrides.get("comfort_limit") or {}).get("max_rise_c" if occ0 else "max_rise_away_c", x_hi)))      # a person's word, whatever the slot holds
                 if h.step(self.x, u, dt) > x_hi + 1e-6:              # too warm: cool at least enough
+                    self._clip("rise_c", ts, h.step(self.x, u, dt), x_hi)
                     u = min(hi, max(u, (a * self.x - x_hi) * h.ua / (1.0 - a)))
                 if h.step(self.x, u, dt) < -lim.precool_c - 1e-6:    # too cold: cool less
                     u = max(lo, min(u, (a * self.x + lim.precool_c) * h.ua / (1.0 - a)))
@@ -367,8 +387,8 @@ class SimulatedHome:
         }
         self.tel.update(self._extra_tel(ts, acc))
         self.recent[i] = self.tel
-        if len(self.recent) > 400:
-            for k in sorted(self.recent)[:-384]:
+        if len(self.recent) > 400:                                  # by distance from this step: rows left ahead of a replay must go, not this run's own
+            for k in [k for k in self.recent if not i - 384 < k <= i]:
                 self.recent.pop(k, None)
 
     def dev_now(self, ts: str) -> dict[str, float]:
@@ -516,32 +536,98 @@ class SimulatedHome:
             self.rt_extra[ts] = round(self.rt_extra.get(ts, 0.0) + float(kw), 4)
 
     def rt_reset(self) -> None:
-        """A new run: no dispatch on top, no owner's wish, the house at its own temperature."""
+        """A new run starts from the node as it was built, whatever the last run left it with or keep.py brought back: no dispatch on top, no owner's wish, the battery at its first charge and the car
+        with its day's budget whole. Live days play one date again and again. On a second play of 2 Jul the cars had spent that date's budget, the campus battery came back low, and homes were paid
+        23.5% less with nobody told. A person's own word stays: an alarm (rt_override), a group kept out, a limit. A restart in the middle of a run doesn't come here: it goes on where it stopped."""
         self.rt_extra.clear()
-        self.overrides.clear()
+        self.rt_override("clear")
         self.events.clear()
+        self.set_battery_fault(False)
+        self.afresh()
+        self.idx, self.reset_on = None, getattr(self.replay, "_line", None)
+
+    def afresh(self) -> None:
+        """Everything a play changes, as it was built. What a person set isn't here, nor what HomeV2.reset clears with the contract, nor the last reading, which stands until the next step's."""
+        self.soc = self.soc0
+        self.ev_left, self.ev_deadline, self.ev_session, self.ev_wait, self.ev_skip, self.prev_wait = 0.0, None, None, None, None, (None, None)
+        self.cf = {"soc": self.soc, "ev_left": 0.0, "ev_deadline": None}
+        self.cf_before = dict(self.cf)
+        self.prev = self.override = self.fault = self.frozen_reading = None
+        self.ev_log, self.cf_ev_log = [], []
+        self.recent.clear()
         self.x = self.prev_x = 0.0
+        self.dev_off, self.app_q, self.app_log, self.app_hold_end = set(), {}, {}, None
+        self.v2h_day, self.v2h_used, self.v2h_owed, self.prev_owed, self.v2h_kw = None, 0.0, 0.0, 0.0, 0.0
+        self.e_part = self.meter_room = 0.0
+        self.levers, self.held_out = None, set()
+        self.clips, self.clip_at = [], {}
+        self.note_seen = None                   # the same words at the same moment of the same date are this run's note
         if self.ctl is not None:
-            self.ctl.last = None
+            self.ctl.afresh()
 
     def rt_override(self, kind: str, value: Any = True) -> None:
         """The owner: ev_now (charge the car at full power, now), comfort ({max_rise_c: ...}), stop (leave the event),
-        depart_at (the car leaves earlier: "YYYY-MM-DD HH:MM"), clear (back to the plan)."""
+        depart_at (the car leaves earlier: "YYYY-MM-DD HH:MM"), clear (back to the plan).
+
+        A person's comfort stays in comfort_limit, where the agent can't write. "comfort" is the slot the plan reads: with no levers it's the person's word, and with
+        levers open that word only tightens what the calls opened, so a looser word can't open what no call did. agent.write_comfort is the agent's door to the slot.
+
+        An alarm leaves alarm_hold behind, and that stays through a clear, a reset and the signal ending. It holds the stop, until a person's signed word takes it away:
+        context.py's clear_alarm, or fleet.py's door for a node with no agent. The hold is read by its key, not its value, and always has a true value: no value anyone
+        sends can read as "not held". An alarm's value is what the signal said, and a value that says nothing is still a signal: only None and False mean it ended."""
+        held = "alarm_hold" in self.overrides
+        if kind in ("ev_now", "clear"):
+            self.car_first = False                                # what a person says of the car is theirs, whatever a wish had said
         if kind == "clear":
+            keep = {k: v for k, v in self.overrides.items() if k in ("alarm", "alarm_hold", "stop")} if held else {}
             self.overrides.clear()
+            self.overrides.update(keep)
+        elif kind == "stop" and held:
+            self.overrides["stop"] = True
         elif kind == "depart_at":
             if self.ev_deadline and value < self.ev_deadline:
                 self.ev_deadline = value
+        elif kind == "comfort" and value not in (None, False):
+            self.overrides["comfort_limit"] = value
+            self.overrides["comfort"] = value if self.levers is None else rt_control.inside(self.overrides.get("comfort") or {}, value)
+        elif kind == "comfort":
+            self.overrides.pop("comfort_limit", None)
+            if self.levers is None:
+                self.overrides.pop("comfort", None)
         elif value in (None, False):
             self.overrides.pop(kind, None)
+            if kind == "note":
+                self.overrides.pop("note_before", None)
+        elif kind == "alarm":                                     # life safety, whoever runs the node: the plan stands down until a person clears it
+            why = value if value is True or (isinstance(value, str) and value.strip()) else self.overrides.get("alarm_hold") or "alarm"
+            self.overrides.update({"alarm": why, "alarm_hold": why, "stop": True})
         else:
+            if kind == "note":
+                self._note_waits()
             self.overrides[kind] = value
-            if kind == "alarm":                                   # life safety, whoever runs the node: the plan stands down until a person clears it
-                self.overrides["stop"] = True
+            if kind == "note":                                    # with when it came: a date in it means what it meant then, and the same words again are a new note
+                self.overrides["note_at"] = self.replay.ts(self.replay.current())
+
+    def _note_waits(self) -> None:
+        """A new note while the one before it is still unread: that one waits beside it, and both are read, the older first. "Keep the battery full tonight" went unread when "Also the car
+        must be charged" came before the next step, and its battery ran to 20%. In place, so a reader taking one off at the same moment takes it off this list."""
+        from ..node.owner import note_key
+        if self.overrides.get("note") and note_key(self.overrides) != self.note_seen:
+            q = self.overrides.setdefault("note_before", [])
+            q.append({"note": self.overrides["note"], "at": self.overrides.get("note_at")})
+            del q[:-NOTES_WAITING]
+
+    def hold_alarm(self, why: Any) -> None:
+        """An alarm's hold, from the record: back after a restart, or asserted at a step. The signal isn't touched, and an alarm already holding keeps its own words."""
+        self.overrides["alarm_hold"] = self.overrides.get("alarm_hold") or why
+        self.rt_override("stop", True)
 
     def advance(self) -> dict[str, Any]:
         cur = self.replay.current()
         if self.idx is None or cur < self.idx or cur - self.idx > 96 * 2:
+            if self.reset_on is not None and self.reset_on != self.replay._line:     # the new run's clock is in: a step played since the reset was on the old one, and isn't this run's
+                self.reset_on = None
+                self.afresh()
             self.idx = cur - 1                                    # (re)start: no catch-up across days
             self.cf = {"soc": self.soc, "ev_left": self.ev_left, "ev_deadline": self.ev_deadline}
         while self.idx < cur:

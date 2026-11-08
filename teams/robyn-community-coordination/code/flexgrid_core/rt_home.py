@@ -45,6 +45,15 @@ class RollingController:
         self.replans = 0
         self.solve_ms: list[float] = []
 
+    def afresh(self) -> None:
+        """A new run: no plan, and nothing worked out from the last one. The limits are people's, and stay."""
+        self.last, self.replans, self._app_cache = None, 0, None
+
+    def said_limits(self) -> Limits:
+        """The limits on file with what a person said on top: what an offer can count on. What the agent's calls hold for now stays out of it."""
+        said = self.sim.overrides.get("comfort_limit")
+        return Limits(**{**self.limits.as_dict(), **said}) if said else self.limits
+
     # ------------------------------------------------------------------ what the home owes
     def target_at(self, ts: str) -> float:
         act = self.sim.plan.get(ts) or {}
@@ -217,7 +226,7 @@ class RollingController:
                        export_limit=s.export_limit, ev_max=s.ev_max if s.has_ev else 0.0,
                        ev_left=ev_need if ev_until else 0.0, ev_until=ev_until, ev_hold=hold, x0=s.x,
                        ua=h.ua if h else 0.0, cap=h.cap if h else 1.0, qmax=h.qmax if h else 0.0, limits=lim, P_ch=s.P_ch,
-                       P_dis=None if s.levers is None else float(s.levers.get("battery_kw", 0.0)))
+                       P_dis=(0.0 if "battery" in s.held_out else None) if s.levers is None else float(s.levers.get("battery_kw", 0.0)))
 
     # --- benchmark: the node's other smart systems (flexgrid_core/devices.py) -------------------------------------------
     def app_holding(self, ts: str) -> bool:
@@ -364,7 +373,7 @@ class RollingController:
         n = len(ts)
         p = Problem(ts=ts, dt=[0.25] * n, pv=[0.0] * n, load=list(cool), cool=cool, cop=cop, occ=occ, ref=list(cool),
                     target=[0.0] * n, watch=[True] * n, ua=self.house.ua, cap=self.house.cap, qmax=self.house.qmax,
-                    limits=self.limits, x0=0.0)
+                    limits=self.said_limits(), x0=0.0)
         call = [window_start <= t < window_end for t in ts]
         kw = capacity(p, call, None)
         return {"kw": round(kw * confidence, 3), "raw_kw": round(kw, 3), "cooling_forecast_kw":

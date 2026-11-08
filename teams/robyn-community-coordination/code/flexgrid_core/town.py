@@ -21,17 +21,153 @@ it, and the demo clock had run ten dataset hours on). The coordinator's clock wa
 """
 from __future__ import annotations
 
+import json
+import logging
 import threading
 import time
-from collections import deque
+from collections import OrderedDict, deque
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from typing import Any, Callable
 
 import httpx
 
+from . import beckn
+
+log = logging.getLogger("flexgrid-town")
+VOLATILE = {"timestamp", "sentWall", "messageId"}         # what a body made again differs in, however alike
+
 
 class TownIdentityConflict(RuntimeError):
     """Another process keeps taking this participant's Town session (each join ends the other's session)."""
+
+
+class TownWatch:
+    """Is Town answering, and are this process's sends getting through? What /health tells (keep.py). One per process: the fleet's 200 sessions share one.
+
+    Every session polls its inbox every few seconds, so this needs no probe of its own. An answer from Town counts as reached; a 5xx (a tunnel or Cloudflare in front
+    of it) or no answer doesn't. A send that raised counts as failed, and so does one Town refused (409: that message went nowhere, see send)."""
+
+    def __init__(self, window: float = 60.0):
+        self.window, self.started = window, time.time()
+        self.ok_at = 0.0                                   # when Town last answered: 0 until it has, so a process that never reached it says so
+        self.sends: deque = deque(maxlen=4000)             # (wall, went through)
+
+    def reached(self, ok: bool) -> None:
+        if ok:
+            self.ok_at = time.time()
+
+    def sent(self, ok: bool) -> None:
+        self.sends.append((time.time(), ok))
+
+    def state(self, now: float | None = None) -> dict[str, Any]:
+        now = time.time() if now is None else now
+        lately = [ok for t, ok in list(self.sends) if now - t <= self.window]
+        return {"town_seen": self.ok_at > 0, "town_ok_s": round(now - (self.ok_at or self.started), 1), "sends": len(lately), "failed": lately.count(False)}
+
+
+def meaning(body: Any) -> Any:
+    """What a body says: all of it but the time it was made and the signature over that, here or in a reading inside a batch."""
+    if isinstance(body, list):
+        return [meaning(x) for x in body]
+    if not isinstance(body, dict):
+        return body
+    return {k: ({a: b for a, b in v.items() if a not in VOLATILE} if k == "context" and isinstance(v, dict) else meaning(v)) for k, v in body.items() if k != "sig"}
+
+
+class Sent:
+    """What this participant has sent, by id. It's how the same id goes only with the same body (ids.py): a body made again carries a new time and signature, so a retry takes the
+    body that went first, and Town answers replay.
+
+    With a file (keep.sent, live) each body is written before Town hears it, so this holds across a restart: a process that dies after a send and sends again finds what it
+    sent, whether or not its state had caught up. An append, flushed and not synced: a killed process keeps it, a power cut can take the last lines, and then Town refuses the
+    rebuilt body, which is loud and loses nothing, because a 409 means Town holds this message already. The file says which run it belongs to, since an id can mean something else
+    in another run. Without a file (the tests, a process with no keep) it lasts as long as the process.
+
+    A journal is only ever a help, so whatever is wrong with the file, this starts: one bad file used to stop all 200 nodes. What can't be read is left out, a copy of the file is kept
+    beside it, and `damaged` says why, for the alarm (keep.Keeper.journals). The one line a kill can tear is no damage: nothing after it was sent, and it never reached Town."""
+
+    def __init__(self, size: int = 512, path: Any = None, run: Any = None):
+        self.size, self.path, self.run = size, Path(path) if path else None, run
+        self.held: OrderedDict[str, tuple[str, str, dict[str, Any]]] = OrderedDict()
+        self.lock = threading.Lock()
+        self.lines = 0
+        self.damaged: str | None = None
+        if self.path:
+            try:
+                self._load()
+            except Exception as exc:                      # noqa: BLE001  a service must start whatever is wrong with its disk. A retry across a restart would miss this, and that's loud
+                log.error("sent journal: %s", exc)
+                self.damaged = f"{type(exc).__name__}: {str(exc)[:120]}"
+
+    def _load(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        raw = self.path.read_bytes() if self.path.exists() else b""
+        *lines, tail = raw.split(b"\n")                   # a whole line ends in a newline. What comes after the last one is the line a killed process was writing
+        rows, bad = [], 0
+        for line in lines:
+            try:
+                rows.append(json.loads(line))
+            except (ValueError, RecursionError):
+                bad += 1
+        head = rows.pop(0) if rows else None
+        if raw and not (isinstance(head, dict) and "run" in head):
+            bad += 1
+        if isinstance(head, dict) and head.get("run") == self.run:
+            for row in rows:
+                if self._row_ok(row):
+                    self.held[row[0]] = (row[1], row[2], row[3])
+                else:
+                    bad += 1
+            while len(self.held) > self.size:
+                self.held.popitem(last=False)
+        if bad:
+            self.damaged = f"{bad} lines of it can't be read"
+            log.error("sent journal %s: %s", self.path.name, self.damaged)
+            self.path.with_suffix(".old").write_bytes(raw)
+        self._rewrite()
+
+    @staticmethod
+    def _row_ok(row: Any) -> bool:
+        return isinstance(row, list) and len(row) == 4 and all(isinstance(x, str) for x in row[:3]) and isinstance(row[3], dict) and isinstance(row[3].get("context", {}), dict)
+
+    def _rewrite(self) -> None:
+        """Only what's still held. The file is the same size as this, give or take a round of sends."""
+        tmp = self.path.with_suffix(".new")
+        with open(tmp, "w") as f:
+            f.write(json.dumps({"run": self.run}) + "\n")
+            for mid, (to, kind, body) in self.held.items():
+                f.write(json.dumps([mid, to, kind, body]) + "\n")
+        tmp.replace(self.path)
+        self.lines = len(self.held)
+
+    def _write(self, mid: str, to: str, kind: str, body: dict[str, Any]) -> None:
+        if not self.path:
+            return
+        try:
+            if self.lines >= 2 * self.size:
+                self._rewrite()
+                return
+            with open(self.path, "a") as f:
+                f.write(json.dumps([mid, to, kind, body]) + "\n")
+            self.lines += 1
+        except OSError as exc:                            # a full disk stops nothing: this send still goes, and only a retry across a restart would miss it
+            log.error("sent journal: %s", exc)
+
+    def body_for(self, mid: str, to: str, kind: str, body: dict[str, Any]) -> dict[str, Any]:
+        """The body to send under this id. The first time, this one. A retry, the first one, unless nobody would read it any more: past its ttl a body made again goes instead.
+        Town takes it if the first never reached it, and refuses it if it did, and then the first is what counts. Something that says otherwise goes as it is, to be refused."""
+        with self.lock:
+            first = self.held.get(mid)
+            again = first is not None and first[:2] == (to, kind) and meaning(first[2]) == meaning(body)
+            if again and beckn.expired(first[2]) is None:
+                return first[2]
+            if first is None or again:
+                self.held[mid] = (to, kind, body)
+                while len(self.held) > self.size:
+                    self.held.popitem(last=False)
+                self._write(mid, to, kind, body)
+            return body
 
 
 class TownSession:
@@ -46,10 +182,14 @@ class TownSession:
         self.session: str | None = None
         self.lock = threading.Lock()
         self.retried = 0                   # calls this session had to try again (a dropped connection, a 502/503/504)
+        self.dropped = 0                   # messages Town refused: their id already held another message
+        self.replays = 0                   # sends Town had already taken: a retry after an answer that never came
+        self.sent = Sent()                 # keep.sent gives a live process one on disk
         self.rejoins: deque = deque(maxlen=10)       # when this session had to join again after a 401
         self.conflict_until = 0.0
         self.conflicts = 0                 # times another process was found using this name
         self.times: deque = deque(maxlen=3000)      # (wall, op, seconds) of each Town call: timing()
+        self.watch = TownWatch()           # the fleet gives all its sessions one
 
     def timing(self, window: float = 120.0) -> dict[str, dict[str, float]]:
         """How long this session's Town calls took in the last `window` s, by kind: {op: {n, p50_ms, p95_ms}}. A
@@ -142,6 +282,15 @@ class TownSession:
             return self.http.request(method, path, headers={"X-Town-Session": session or ""}, **kw)
 
     def _call(self, method: str, path: str, **kw) -> httpx.Response:
+        try:
+            r = self._tried(method, path, **kw)
+        except httpx.HTTPError:
+            self.watch.reached(False)
+            raise
+        self.watch.reached(r.status_code < 500)
+        return r
+
+    def _tried(self, method: str, path: str, **kw) -> httpx.Response:
         if time.time() < self.conflict_until:
             raise TownIdentityConflict(f"{self.name}: paused, another process holds this Town session")
         if not self.session:
@@ -160,12 +309,24 @@ class TownSession:
         return r
 
     def send(self, to: str, kind: str, body: dict[str, Any], message_id: str) -> dict[str, Any]:
-        r = self._call("POST", f"/runs/{self.run_id}/messages",
-                       json={"message_id": message_id, "to": to, "kind": kind, "body": body})
-        if r.status_code == 409:
-            return {"message_id": message_id, "duplicate": True}
-        r.raise_for_status()
-        return r.json()
+        body = self.sent.body_for(message_id, to, kind, body)
+        try:
+            r = self._call("POST", f"/runs/{self.run_id}/messages",
+                           json={"message_id": message_id, "to": to, "kind": kind, "body": body})
+            if r.status_code == 409:
+                # Town answers a retry of the same envelope as it did the first time, with "replay": true. A 409 means this id already holds a different
+                # message, and this one went nowhere (nandatown db.accept_message). The caller records it: that's how a day's readings vanished on 6 Nov 2026
+                self.dropped += 1
+                self.watch.sent(False)
+                return {"message_id": message_id, "duplicate": True}
+            r.raise_for_status()
+        except Exception:
+            self.watch.sent(False)
+            raise
+        self.watch.sent(True)
+        out = r.json()
+        self.replays += 1 if out.get("replay") else 0
+        return out
 
     def notify(self, wait: float = 0.0) -> bool:
         """Pop one wake-up hint. Keep `wait` at 0 (see the module docstring: a held long-poll costs Town ~20 scans a

@@ -68,7 +68,6 @@ import tempfile
 import threading
 import time
 import traceback
-import uuid
 from collections import Counter, OrderedDict, deque
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
@@ -82,7 +81,7 @@ except ImportError:                 # pragma: no cover
 
 import httpx
 
-from . import beckn, config, signing, wire
+from . import beckn, config, doors, ids, signing, wire
 from . import datacenter as dc
 from .dc_market import DCMarket
 from .replay import Replay
@@ -233,7 +232,7 @@ class DCFleet:
         self._joining = False
         self.pool = ThreadPoolExecutor(max_workers=int(c.get("dc_send_workers", 8)))          # data centers' sends
         # the campus link (market role) and the trust it was given (sites role)
-        self.chttp = httpx.Client(timeout=float(c.get("dc_campus_timeout_s", 10.0)))
+        self.chttp = httpx.Client(timeout=float(c.get("dc_campus_timeout_s", 10.0)), headers=doors.headers())
         self.campus: dict[str, Any] = {"url": self.campus_url, "reached": None}
         self._camp_cache: tuple[float, dict[str, Any] | None] = (0.0, None)
         self.site_pins: dict[str, str] = {}
@@ -459,6 +458,8 @@ class DCFleet:
             t0 = time.time()
             try:
                 out = town.send(to, kind, body, mid)
+                if isinstance(out, dict) and out.get("duplicate"):    # Town refused it: see town.send
+                    self._town_error(f"send {town.name}->{to}", RuntimeError(f"Town refused {kind}: id {mid} holds another message"))
                 self._timed("send", t0)
                 with self._tlock:
                     self.town_out[self.role(town.name)] += 1
@@ -535,19 +536,20 @@ class DCFleet:
         with self.lock:
             if mid in self._seen:
                 self.redelivered += 1
-                return "already handled (redelivered)", "processed"
-            self._seen[mid] = True
+                return "already handled (redelivered)", self._seen[mid]      # what it came to the first time
+            self._seen[mid] = "rejected"
             while len(self._seen) > 20000:
                 self._seen.popitem(last=False)
             sent = (body.get("context") or {}).get("sentWall") if isinstance(body, dict) else None
             if isinstance(sent, (int, float)) and sent < self.epoch_wall:
                 self.stale_in += 1
-                return "sent before this run started: not acted on", "rejected"
+                return beckn.Refused("sent before this run started: not acted on"), "rejected"
             self.town_in[self.role(to)] += 1
             if isinstance(sent, (int, float)):                       # made -> sent -> waiting in Town -> claimed here
                 self.lat.append((self.role(to), max(0.0, time.time() - sent)))
             note = self._dispatch(str(msg.get("from") or ""), to, str(msg.get("kind", "")), body)
-        return note, ("rejected" if note.startswith(("refused", "error", "rejected")) else "processed")
+            self._seen[mid] = beckn.ack_of(note)[0]
+        return note, self._seen[mid]
 
     def _reset_town_stats(self) -> None:
         """Town traffic counts are per run (the record's run); the Town calls' own durations are kept (the link)."""
@@ -758,24 +760,26 @@ class DCFleet:
                 why = "malformed offer"
             if why:
                 self._logger(self.desk_name)("refused", sender=frm, message_kind=kind, reason=why)
-                return f"refused: {why}"
+                return beckn.Refused(f"refused: {why}")
         self.msg_steps.setdefault(self.clock.current(), Counter())[f"{self.role(frm)}{self.role(to)}:{act}"] += 1
         self.traffic[act] += 1
         try:
             if to == self.desk_name and self.desk is not None:
-                return str(self.desk.handle(kind, frm, body))
-            if to == self.op_name and self.op is not None:
+                out = self.desk.handle(kind, frm, body)
+            elif to == self.op_name and self.op is not None:
                 with self.op.lock:
-                    return str(self.op.handle(kind, frm, body))
-            if to in self.agents:
-                return str(self.agents[to].handle(kind, frm, body))
-            self._logger("flexgrid-dc")("undeliverable", to=to, message_kind=kind)
-            return "refused: undeliverable"
+                    out = self.op.handle(kind, frm, body)
+            elif to in self.agents:
+                out = self.agents[to].handle(kind, frm, body)
+            else:
+                self._logger("flexgrid-dc")("undeliverable", to=to, message_kind=kind)
+                out = beckn.Refused("refused: undeliverable")
+            return out if isinstance(out, str) else str(out)
         except Exception as exc:                                        # one bad message must not stop the others
             self.errors += 1
             self._logger("flexgrid-dc")("handle_error", to=to, message_kind=kind, error=str(exc)[:200])
             log.error("deliver %s -> %s: %s", frm, to, traceback.format_exc())
-            return f"error: {str(exc)[:160]}"
+            return beckn.Refused(f"error: {str(exc)[:160]}")
 
     def tick(self) -> None:
         """One pass: every site here to the clock's step (each agent sends the meter readings that are due), then the
@@ -874,7 +878,7 @@ class DCFleet:
             body = beckn.make("update", sender=self.desk_name, receiver=name, transaction_id=f"clean-{tomorrow}",
                               message={"clean_allowance": {"start": f"{tomorrow} 00:00", "kw": kw}}, key=self.ckey)
             self._post(self.desk_name, name, beckn.kind("update"), body,
-                       f"{self.desk_name}:clean:{tomorrow}:{name}:{uuid.uuid4().hex[:6]}")
+                       ids.sealed(self.ckey, self.desk.play, self.desk_name, name, "update", "clean", tomorrow))
         kwh = {name: round(sum(alw.get(eid) or []) * 0.25, 1) for eid, name in zip(self.ids, self.names)}
         self.allowance[day] = {"for": tomorrow, "kwh": kwh, "total_kwh": round(sum(kwh.values()), 1), "made_at": now}
         self._logger(self.desk_name)("dc_clean_allowance_sent", date=tomorrow, kwh=round(sum(kwh.values()), 1))
@@ -1763,7 +1767,7 @@ def build_app(f: DCFleet):
     from fastapi.middleware.gzip import GZipMiddleware
     from fastapi.responses import JSONResponse
 
-    app = FastAPI(title="flexgrid-dc", version="0.3.0")
+    app = FastAPI(title="flexgrid-dc", version="0.3.0", dependencies=[doors.door()])
     app.add_middleware(GZipMiddleware, minimum_size=2000)           # the record crosses an SSH tunnel in the split
 
     def fail(exc: ValueError):

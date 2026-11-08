@@ -89,6 +89,36 @@ class Problem:
                                      # people's comfort in proportion to its size, or the plan warms it to save energy
 
 
+def inside(held: dict[str, float], said: dict[str, float] | None) -> dict[str, float]:
+    """The agent's comfort, never past what a person said: each limit at the lower of the two."""
+    return {**held, **{k: min(float(held.get(k, v)), float(v)) for k, v in (said or {}).items()}}
+
+
+def person_limit(sim: Any, key: str) -> float:
+    """One comfort limit in force: what a person said today, else the one on file. What the agent's own calls opened doesn't count here."""
+    v = ((getattr(sim, "overrides", None) or {}).get("comfort_limit") or {}).get(key)
+    return float(getattr(sim.ctl.limits, key)) if v is None else float(v)
+
+
+def write_limit(sim: Any, group: str, name: str, value: float) -> None:
+    """A person's limit reaches the simulated controller: through context.py on a node with an agent, through fleet.code_channel on one with none."""
+    if group == "hvac_zones":
+        setattr(sim.ctl.limits, name, value)
+        held = getattr(sim, "overrides", {}).get("comfort") or {}
+        if hasattr(sim, "overrides"):             # the agent's facts and writes read this, and a building's menu has no other way to see it
+            sim.overrides["comfort_limit"] = {**(sim.overrides.get("comfort_limit") or {}), name: value}
+        if held.get(name, value) > value or (name in held and sim.levers is None):     # the override replaces the limits, so a running call would keep more than the person now allows.
+            sim.overrides["comfort"] = {**held, name: value}                           # With no levers the slot is the person's own word, so this one replaces it, up or down
+        if name == "max_rise_c":
+            sim.person_rise = value               # a building writes its comfort every step: this stays above that
+    elif group == "energy_storage":
+        sim.R = value / 100.0
+    elif group == "lighting_and_shading" and hasattr(sim, "light_default"):
+        sim.light_default = value                 # what a clear goes back to, as with a person's comfort limit
+        if float(sim.overrides.get("lights", value)) > value:
+            sim.overrides["lights"] = value       # lower than what the door left, it holds now. Higher, a clear brings it: a restart plays old words again, and must not lift a later lowering
+
+
 def _var_index(K: int) -> dict[str, slice]:
     names = ("d", "c", "e", "u", "x", "S", "short", "over", "dis", "viol", "xtra")
     return {n: slice(i * K, (i + 1) * K) for i, n in enumerate(names)}

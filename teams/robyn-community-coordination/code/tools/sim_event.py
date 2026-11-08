@@ -45,6 +45,7 @@ from flexgrid_core.home_v2 import HomeV2  # noqa: E402
 from flexgrid_core.market import Market  # noqa: E402
 from flexgrid_core.replay import Replay  # noqa: E402
 from flexgrid_core.report_rule import PoolNode, QuietNode  # noqa: E402
+from flexgrid_core.rt_control import person_limit  # noqa: E402
 from flexgrid_core.stand_in import StandInBuyer  # noqa: E402
 from flexgrid_core.utility import Utility  # noqa: E402
 
@@ -395,7 +396,7 @@ def run_event(event_day: str, opt_out: int = 0, quiet: bool = True, tolerance: f
     for s in n["slots"]:
         sid = str(s["id"])
         b = sum(m[sid]["BASELINE"] for m in ev["baselines"].values() if sid in m)
-        t = sum(r[s["id"]]["truth"]["usage_without_event_kw"] for r in ev["readings"].values() if s["id"] in r)
+        t = sum((r[s["id"]].get("truth") or {}).get("usage_without_event_kw", 0.0) for r in ev["readings"].values() if s["id"] in r)
         u = sum(r[s["id"]]["usage_kw"] for r in ev["readings"].values() if s["id"] in r)
         base_vs_true.append({"slot": s["id"], "start": s["start"], "baseline_kw": round(b, 1),
                              "true_no_event_kw": round(t, 1), "actual_kw": round(u, 1)})
@@ -492,41 +493,20 @@ def _case_weather(h, kind: str, at: str, end: str, sp: dict) -> dict:
 
 def _zones(h):
     """The building's zone map, for what its sensors read. None for a node without one."""
-    from flexgrid_core.node import buildings as zones
-    return zones.load(h.name) if h.name in zones.KEYS else None
+    from flexgrid_core.node import surprises
+    return surprises.zones(h)
 
 
 def _close_building(h, sp: dict, now: str) -> None:
-    """Closed for the day: its true load falls, the no-event twin's with it, so nothing it does from here counts as relief. It leaves the
-    sale. Its report and its agent's answer are theirs to make."""
-    a, rp = h.adapter, h.replay
-    i = rp.idx_of(now)
-    night = sum(rp.rows[j]["base_kw"] for j in range(rp.idx_of(f"{now[:10]} 02:00"), rp.idx_of(f"{now[:10]} 04:00"))) / 8
-    share = float(sp["share"]) if sp.get("share") is not None else min(1.0, night / max(rp.rows[i]["base_kw"], 1.0))
-    h.replay.weather = {**(h.replay.weather or {}), "from": now, "to": beckn.add_minutes(f"{now[:10]} 00:00", 1440), "pv": 1.0, "load": share}
-    a.rt_override("closed", {"from": now, "share": share})
-    a.rt_override("stop", True)
-    zone = _zones(h)
-    if zone:
-        zone.surprises.append({"from": now, "to": beckn.add_minutes(f"{now[:10]} 00:00", 1440), "space": None, "share": 0.0})
+    """Closed for the day (flexgrid_core/node/surprises.py, which a real building's service calls too)."""
+    from flexgrid_core.node import surprises
+    surprises.close_building(h, now, sp.get("share"))
 
 
 def _zone_event(h, sp: dict, now: str) -> None:
-    """A zone already sold must run as normal from now on: that share of the lights can't dim and that share of the comfort room is gone.
-    The controller finds what's left, and the node reports the rest."""
-    a, z = h.adapter, float(sp.get("share", 0.25))
-    end = beckn.add_minutes(now, 60 * float(sp.get("hours", 3.5)))
-    a.rt_override("zone_event", {"from": now, "to": end, "share": z, "space": sp.get("space")})
-    zone = _zones(h)
-    if zone:                                                   # the sensors read the room in use: the building's agent sees it itself
-        s = sp.get("space") or max((k for k, v in zone.spaces.items() if not v.get("closed")), key=lambda k: zone.spaces[k].get("area", 0.0))
-        zone.surprises.append({"from": now, "to": end, "space": s, "share": 1.0})
-    if hasattr(a, "dim_max"):
-        a.rt_override("lights", a.dim_max() * (1 - z))
-    if hasattr(a, "sell"):                                     # its fans and plugs too: the sale's part of them shrinks with the free space
-        a.sell = {**a.sell, **{k: float(a.sell.get(k, a.app[k].get("share", 1.0))) * (1 - z) for k in a.app if k != "ev"}}
-    lim = a.ctl.limits
-    a.rt_override("comfort", {"max_rise_c": lim.max_rise_c * (1 - z), "max_rise_away_c": lim.max_rise_away_c * (1 - z)})
+    """An event in a zone already sold (flexgrid_core/node/surprises.py, which a real building's service calls too)."""
+    from flexgrid_core.node import surprises
+    surprises.zone_event(h, now, float(sp.get("share", 0.25)), float(sp.get("hours", 3.5)), sp.get("space"))
 
 
 def _rebound_check(ev: dict, feeder: dict) -> dict:
@@ -565,7 +545,7 @@ def main() -> None:
     ap.add_argument("--only", default="", help="comma-separated home names: only these homes get the call "
                     "(to replay a live run in which some homes were not reached)")
     ap.add_argument("--baseline", default="ptr", choices=["ptr", "weather_regression"],
-                    help="the utility's settlement baseline: Ameren Rider PTR (3 of 14) or weather-normalized regression")
+                    help="the utility's settlement baseline: the rule in force (settlement.baseline_rule) or weather-normalized regression")
     ap.add_argument("--buildings", default="", help="comma-separated building nodes that take part too "
                     "(data_ma/buildings.json, e.g. bld-library); they run the 5-minute plan")
     ap.add_argument("--control-mode", default="fixed", choices=["fixed", "rolling"], help="the homes' plan")

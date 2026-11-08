@@ -1,6 +1,6 @@
 # FlexGrid
 
-**Every load in this repository is simulated.** Homes and buildings replay a dataset, the homes are synthetic, and no real device or meter is involved. [DATA_NOTICE.md](DATA_NOTICE.md) says what each dataset is.
+**Every load in this folder is simulated.** Homes and buildings replay a dataset, the homes are synthetic, and no real device or meter is involved. [DATA_NOTICE.md](DATA_NOTICE.md) says what each dataset is.
 
 FlexGrid is a market for demand flexibility. On a hot evening the grid needs people to use less power for a few hours. Homes and buildings can do that: a battery discharges, a car waits to charge, a building lets its cooling drift, a dryer runs later. One home's cut is too small to sell, so FlexGrid pools many into one sale.
 
@@ -16,11 +16,11 @@ This is course work for MIT AI Studio, Fall 2026 (Homework 8). It is not a produ
 | `tools/sim_event.py`, `tools/market_day.py`, `tools/scorecard.py` | The offline simulator: the same code plays a day in one process, with an in-memory bus and a virtual clock, and no Town. Every node runs on rules there |
 | `data_year_t1b/` | A small data pack: 8 homes and 3 buildings, 1 to 28 Jan and 1 Jun to 3 Jul 2026, every 15 minutes |
 
-The live deployment, the trained models, the user interfaces, the test suite and the benchmark are not in this repository.
+The live deployment, the trained models, the user interfaces, the test suite and the benchmark are not in this folder.
 
 ## Install
 
-Python 3.11 or newer. In a clone of this repository:
+Python 3.11 or newer. From this folder, in a clone of this repository:
 
 ```bash
 python3 -m venv .venv && source .venv/bin/activate
@@ -38,11 +38,12 @@ python tools/market_day.py 2026-06-29 --homes 8
 
 ## How the Nanda Town check uses it
 
-The check lives in Nanda Town's repository, in `examples/flexgrid/`, and FlexGrid's code does not. Set `FLEXGRID_HOME` to a clone of this repository, and `FLEXGRID_BASELINE_HOME` to a worktree of the baseline tag. With the clone in a folder called `flexgrid`, from the folder that holds it:
+The check lives in Nanda Town's repository, in `examples/flexgrid/`, and FlexGrid's code does not. Set `FLEXGRID_HOME` to this folder in a clone of this repository, and `FLEXGRID_BASELINE_HOME` to the same folder in a worktree of the baseline tag. With the clone in a folder called `flexgrid`, from the folder that holds it:
 
 ```bash
-git -C flexgrid worktree add ../flexgrid-6nov hw8-baseline-6nov
-export FLEXGRID_HOME=$PWD/flexgrid FLEXGRID_BASELINE_HOME=$PWD/flexgrid-6nov
+git -C flexgrid worktree add ../flexgrid-6nov flexgrid-hw8-baseline-6nov
+F=teams/robyn-community-coordination/code
+export FLEXGRID_HOME=$PWD/flexgrid/$F FLEXGRID_BASELINE_HOME=$PWD/flexgrid-6nov/$F
 ```
 
 Then, from a Nanda Town checkout, `python examples/flexgrid/run_check.py --cases normal_rules` plays one day with every node on rules, and `--cases normal --model URL --model-name NAME` plays it with every node an agent, on an Ollama-style model.
@@ -57,8 +58,8 @@ The check copies `flexgrid_core/` and the three tools to a temporary folder, lin
 
 | Version | Where | What it is |
 |---|---|---|
-| 6 Nov 2026 baseline | tag `hw8-baseline-6nov` | The code as it ran on 6 Nov 2026. The check's failure case runs on it: batch ids repeat on a second play, Town refuses them, and the sellers go unpaid |
-| Current | `main` | Every node an agent, the clock that waits for them, and the fixes since 6 Nov: a message's id says which message it is, the same within a play and new across plays, a refused send is counted, nodes keep their state on disk through a crash, and readings are checked against what a meter can do |
+| 6 Nov 2026 baseline | tag `flexgrid-hw8-baseline-6nov` | The code as it ran on 6 Nov 2026. The check's failure case runs on it: batch ids repeat on a second play, Town refuses them, and the sellers go unpaid |
+| Current | tag `flexgrid-hw8-recorded`, and this folder on `main` | Every node an agent, the clock that waits for them, and the fixes since 6 Nov: a message's id says which message it is, the same within a play and new across plays, a refused send is counted, nodes keep their state on disk through a crash, and readings are checked against what a meter can do |
 
 Both have the same data pack.
 

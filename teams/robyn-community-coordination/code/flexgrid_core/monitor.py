@@ -30,6 +30,7 @@ from typing import Any, Callable
 import httpx
 
 from . import beckn, config
+from . import settlement as st
 from .settlement import clamp0
 
 SCHEMA = "flexgrid.timeline.v1"
@@ -84,7 +85,7 @@ def state_code(ev: dict[str, Any] | None, name: str, tel: dict[str, Any], now: s
 
 def household_money(ev: dict[str, Any]) -> dict[str, dict[str, Any]]:
     """Per home that sent readings: what FlexGrid paid it, what the same home would be paid on its own under the same
-    Peak Time Rewards credit (same Rider PTR baseline, same price per kWh, no agent: its meter as in the no-event
+    Peak Time Rewards credit (same baseline, same price per kWh, no agent: its meter as in the no-event
     twin), and its real and measured reduction. The twin's usage travels in each reading (truth.usage_without_event_kw,
     simulation truth); the coordinator never uses it. Partial while readings arrive."""
     prices = {str(s["id"]): s["price"] for s in ev["need"]["slots"]}
@@ -127,9 +128,10 @@ def labels() -> dict[str, str]:
                             "holidays or event days", "baseline_short": "the Ameren Peak Time Rewards baseline"}
     return {"price": "ISO New England real-time price", "price_where": m.get("price_label", "ISO New England real-time price"),
             "program": "a ConnectedSolutions-style program",
-            "baseline": "the 3 highest of the 14 previous days that are not holidays or event days (the Rider PTR "
+            "baseline": st.baseline_rule() if st.MARKET else
+                        "the 3 highest of the 14 previous days that are not holidays or event days (the Rider PTR "
                         "method, kept for comparison with the Illinois runs; ConnectedSolutions itself pays a "
-                        "battery on its measured output)", "baseline_short": "the 3-of-14 baseline"}
+                        "battery on its measured output)", "baseline_short": "the last-10-days baseline" if st.MARKET else "the 3-of-14 baseline"}
 
 
 RAW_KEYS = ("import_kw", "import_cf_kw")          # unrounded per-home import, kept for the money numbers only
@@ -163,7 +165,7 @@ def household_how() -> str:
 
 def alone_how() -> str:
     return (f"What the same homes would be paid on their own under {labels()['program']}, at the same price per kWh "
-            "and with the same baseline (the 3 highest of the 14 previous days that are not holidays or event days), "
+            f"and with the same baseline ({labels()['baseline']}), "
             "with no agent: each meter as in its no-event twin. Their real reduction is then zero; that payment comes "
             "from the baseline sitting above what the homes would have used anyway.")
 
@@ -211,15 +213,16 @@ def benefits(steps: list[str], s: dict[str, list[float]], need: dict[str, Any], 
     if result:
         out["paid_usd"] = {"total": result.get("utility_pays_usd"), "homes": result.get("homes_paid"),
                            "median": result.get("median"), "max": result.get("max"),
-                           "how": f"DEG demand-flex settlement: ${need['slots'][0]['price']:g} per kWh of capacity offered and delivered in each "
-                                  "30-minute slot, split among the homes pro rata to their measured delivery."}
+                           "how": f"DEG demand-flex settlement at up to ${need['slots'][0]['price']:g} per kWh: {st.bill_rule()}. A node's pay: {st.pay_rule()}." if st.MARKET else
+                                  f"DEG demand-flex settlement: ${need['slots'][0]['price']:g} per kWh of capacity offered and delivered in each "
+                                  f"30-minute slot, shared out by the rule in force: {st.pay_rule()}."}
         shares = {n: v.get("paid_usd") for n, v in (money or {}).items() if v.get("paid_usd") is not None}
         if shares:
             zero = sorted(n for n, v in shares.items() if not v > 0)
             out["paid_usd"].update({
                 "homes": len(shares) - len(zero), "homes_in_split": len(shares), "zero_share": zero,
-                "how_zero": ("Homes in the split whose share is $0: the utility's baseline (the 3 highest of the 14 "
-                             "previous days) measured no reduction at their meters, so the split by measured delivery "
+                "how_zero": ("Homes in the split whose share is $0: the utility's baseline measured no reduction "
+                             "at their meters, so the split by measured delivery "
                              "gave them nothing, even if they truly delivered.") if zero else None})
         alone = [v["alone_usd"] for v in (money or {}).values() if v.get("alone_usd") is not None]
         if alone:
@@ -230,9 +233,8 @@ def benefits(steps: list[str], s: dict[str, list[float]], need: dict[str, Any], 
         out["delivered_kwh"] = {"promised": result.get("promised_kwh"), "true": result.get("true_kwh"),
                                 "measured": result.get("measured_kwh"),
                                 "how": "Promised = capacity sold x 0.5 h per slot. True = twin minus actual meter. "
-                                       f"Measured = {labels()['baseline_short']} (the 3 highest of the 14 "
-                                       "previous days that are not holidays or event days) minus the meter: what the "
-                                       "utility pays on, capped at the capacity sold."}
+                                       f"Measured = {labels()['baseline_short']} ({labels()['baseline']}) minus the meter: what the "
+                                       f"utility pays on{'' if st.MARKET else ', capped at the capacity sold'}."}
     return out
 
 
@@ -285,7 +287,7 @@ def event_static(ev: dict[str, Any], fleet: dict[str, dict], names: list[str], t
                                             "battery_share", "rebound_guard", "margin")},
         "settlement": {"components": (ev.get("settlement") or {}).get("components"),
                        "seller_usd": (ev.get("result") or {}).get("seller_usd"),
-                       "policy": "beckn/DEG demand-flex contract policy (rego), ported"},
+                       "policy": st.policy_rule()},
     }
 
 
@@ -810,7 +812,7 @@ class LiveRecorder:
     def _summary(self, ev: dict[str, Any], energy: dict[str, float] | None = None) -> dict[str, Any]:
         cap = ev.get("capacity_offered_final") or ev.get("capacity_offered") or {}
         res = ev.get("result") or {}
-        truth = sum(r.get("truth", {}).get("delivered_true_kw", 0.0) * 0.5 for rs in ev["readings"].values()
+        truth = sum((r.get("truth") or {}).get("delivered_true_kw", 0.0) * 0.5 for rs in ev["readings"].values()
                     for r in rs.values())
         split = res.get("split", {}).get("per_home", {})
         pays = sorted(split.values())

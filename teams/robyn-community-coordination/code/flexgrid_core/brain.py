@@ -31,12 +31,14 @@ from __future__ import annotations
 import json
 import threading
 import time
-from collections import deque
+from collections import Counter, deque
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
 from . import beckn
+from .node import grounds
+from .node.arm import all_agents
 
 DEFAULT_WISHES = {"skip_until": None, "skip_days": [], "no_ev_pause": False, "battery_max_share": 1.0,
                   "min_price_usd_per_kwh": 0.0, "notes": [], "devices_off": []}
@@ -66,7 +68,7 @@ class Wishes:
         self.lock = threading.Lock()
         try:
             self.w = {**DEFAULT_WISHES, **json.loads(path.read_text())}
-        except (OSError, ValueError):
+        except (OSError, ValueError, TypeError, RecursionError):
             self.w = json.loads(json.dumps(DEFAULT_WISHES))
 
     def get(self) -> dict[str, Any]:
@@ -216,14 +218,16 @@ planner has already worked out a SAFE offer: what the battery can give above its
 the EV charger saves. You decide how much of it to offer: take part or not, the share of the battery part (0 to 1),
 and whether to pause the EV. The home's other smart devices are listed under "devices" with the kW each can give; name
 any you want left out of this event in devices_off (for example the dryer when the owner's words ask for laundry tonight).
-You can only lower the safe offer; the home's code enforces every limit and the owner's wishes after you. Promising more than the home delivers costs reputation and future income, so offer less when the
-forecast is uncertain, the battery will start low, or the owner's wishes or words point that way; offer fully when it
-is safe and worth it. Reasons: one or two plain sentences, with the numbers that mattered."""
+You can only lower the safe offer; the home's code enforces every limit and the owner's wishes after you. Only what the meter shows is paid, so a promise the home doesn't keep earns nothing,
+but the safe offer already sits above the battery's reserve and inside the owner's comfort limit, with 20 % off the cooling and the devices for forecast error, so forecast uncertainty is
+allowed for. Offer less only for a fact the planner can't see: the owner's wishes or words, a battery that will start low, a device out of service. Otherwise offer fully.
+Reasons: one or two plain sentences, with the numbers that mattered."""
 
 HOME_ACCEPT = """You are the AI energy agent of one household in a FlexGrid community. The coordinator has sent this
 home its share of the community's commitment. The home's trust guard has already checked it is within your offer and
-safe. Accept unless something changed since the offer that makes it unwise (the owner's wishes or words, the battery
-far lower than expected). Declining costs the community and this home's reputation. One or two plain sentences."""
+safe, and it asks you because something changed since the offer: see changed_since_the_offer. Accept unless that makes it unwise.
+A home that declines is replaced from spare offers if there are any, and the sale can fall short by its part. To decline, put the id of the change in decline_fact: a decline stands
+only on a change that bears on nearly all of the offer. Otherwise accept, and the home gives what it can. One or two plain sentences."""
 
 HOME_CHAT = """You are the AI energy agent of {home} ({label}), a household in a FlexGrid community in Worcester County,
 Massachusetts. You talk with the homeowner in their phone app. FlexGrid pays households for using less power from the
@@ -239,6 +243,43 @@ call set_emergency_permission. real_time_now tells you what the home owes now an
 You never control devices directly, and the home's safety limits always apply: the car always leaves charged."""
 
 
+HOME_RAISE = """You are the AI energy agent of one household in a FlexGrid community (Boston area, Massachusetts). You already offered part of
+your home's safe offer for this evening. All the offers together are now short of what the buyers ordered and of the reserve kept behind it, so the
+community asks the homes and buildings that held something back whether they can give more, at the same price per kWh delivered. The facts say how
+much is missing and how much you held back. The safe offer is not a wish: the home's planner worked it out from the forecast, above the battery's
+backup reserve and inside the owner's comfort limit, and took 20 % off the cooling and the devices for forecast error. The home's code stops at those
+limits whatever you offer. So forecast uncertainty alone is already allowed for. Keep something back only for a fact the planner can't see: the
+owner's wishes or words, a battery that will start low, a device out of service. Otherwise raise the share of the battery part to 1 and name no device
+in devices_off. Your shares can only go up from your first answer. Reasons: one or two plain sentences, with the numbers that mattered."""
+
+
+def held_back(limit: dict[str, Any], final: dict[str, Any]) -> dict[str, float]:
+    """kW per half hour between what the code allows, after the owner's limits, and what the agent offered."""
+    return {str(a["id"]): round(max(0.0, float(a["kw_offered"]) - float(b["kw_offered"])), 2) for a, b in zip(limit["slots"], final["slots"])}
+
+
+NO_REASON, NO_FACT = "no reason given", "reason cites no fact"       # a receipt's flags, with every node an agent (node/arm.py)
+REASON_AGAIN = ("\n\nYour last answer gave less than the rule's amount and said no reason. Answer again with the same JSON object, and give your reason for the "
+                "person in plain words, with the fact it rests on.")
+
+
+def kw_of(offer: dict[str, Any]) -> list[float]:
+    return [round(float(s.get("kw_offered") or 0.0), 2) for s in offer.get("slots") or []]
+
+
+def mean_kw(offer: dict[str, Any]) -> float:
+    k = kw_of(offer)
+    return sum(k) / max(1, len(k))
+
+
+def pool_facts(need: dict[str, Any], more: dict[str, Any]) -> dict[str, Any]:
+    """The second round's numbers, as the agent reads them."""
+    ids = [s["id"] for s in need.get("slots") or []]
+    return {"ordered_kw_per_half_hour": [(more.get("ordered_kw") or {}).get(str(i)) for i in ids],
+            "all_offers_short_by_kw_per_half_hour": [(more.get("short_kw") or {}).get(str(i)) for i in ids],
+            "reserve_share_on_top_of_the_order": more.get("margin")}
+
+
 class HomeBrain:
     CHAT, ROLE = HOME_CHAT, "home"           # the owner's chat: its system prompt, the agent's role for the runtime
 
@@ -252,8 +293,10 @@ class HomeBrain:
         self.forecasts: dict[str, dict[str, Any]] = {}
         self._done: dict[str, Any] = {}               # event / contract id -> the decision already made (redelivery,
         self._lock = threading.Lock()                 # or the Langflow step and the in-process path asking twice)
+        self.safe: dict[str, dict[str, Any]] = {}     # event id -> the planner's safe offer, for the second round
         self.chat_log: deque = deque(maxlen=40)
         self.chat_lock = threading.Lock()
+        self.fallbacks: Counter = Counter()          # decisions the rules made because the model failed: offer, offer_raise, accept
         self.tool_calls: deque = deque(maxlen=60)    # every tool run (by our own loop, or by OpenClaw through MCP)
 
     def run_tool(self, name: str, args: dict[str, Any] | None = None, *, by: str = "agent") -> Any:
@@ -274,6 +317,99 @@ class HomeBrain:
         self.tool_calls.append({"tool": name, "args": args or {}, "result": res, "by": by, "wall": time.time(),
                                 "ms": round((time.perf_counter() - t0) * 1000, 1)})
         return res
+
+    # ---- every node an agent (node/arm.py): a reason for less than the rule's amount, a receipt for each decision, and the person told why
+    WHO = "owner"
+
+    @staticmethod
+    def said(ans: dict[str, Any] | None) -> str:
+        return str((ans or {}).get("reason_for_owner") or (ans or {}).get("reason_for_manager") or "").strip()
+
+    def decide_reasoned(self, role: str, system: str, facts: dict[str, Any], schema: dict[str, Any], *, budget_s: float, session: str,
+                        less: Callable[[dict[str, Any]], bool]) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+        """The model's answer. With every node an agent, one that gives less than the rule's amount and says no reason is asked once more."""
+        ans, meta = self.backend.decide(role, system, facts, schema, budget_s=budget_s, session=session)
+        if ans is not None and all_agents() and less(ans) and not self.said(ans):
+            again, m2 = self.backend.decide(role, system + REASON_AGAIN, facts, schema, budget_s=budget_s, session=f"{session}-again")
+            ans, meta = (again, m2) if again is not None else (ans, meta)
+            meta = {**meta, "asked_again": NO_REASON}
+        return ans, meta
+
+    def receipt(self, point: str, **r: Any) -> None:
+        """The node's own decision log keeps the receipt, through its agent (NodeAgent.receipt)."""
+        ag = getattr(self.v2, "agent", None)
+        if ag is not None and hasattr(ag, "receipt"):
+            ag.receipt(point, self.v2.now_ts(), **r)
+
+    def tell(self, text: str, point: str) -> str:
+        ag = getattr(self.v2, "agent", None)
+        if ag is not None and hasattr(ag, "tell"):
+            ag.tell(text, point, self.v2.now_ts())
+        return text
+
+    def offer_receipt(self, point: str, need: dict[str, Any], rule: dict[str, Any], final: dict[str, Any], ans: dict[str, Any] | None, check: dict[str, Any],
+                      flags: list[str], fmt: Callable[[float], str] = lambda x: f"{x:.1f}", without: dict[str, Any] | None = None) -> None:
+        """An offer's receipt: the request, the rule's kW, the agent's kW, its reason and its fact. The person hears why when it gave less.
+        without: the rule's offer had no person's note kept part of it out. A rule can't read a note, so the receipt measures against that: the note's part is flagged, the
+        note is its fact, and the person hears it was heard (owner.got_it). The model's own cut is still weighed against the rule under the note (decide_offer)."""
+        noted = without is not None and sum(kw_of(without)) > sum(kw_of(rule)) + 0.01
+        base = without if noted else rule
+        less = sum(kw_of(final)) < sum(kw_of(base)) - 0.01
+        said = self.said(ans)
+        told = None
+        why = NO_REASON if NO_REASON in flags else said if ans is not None else "the model did not answer: the rule's offer"
+        facts = [g for g in check.get("grounds") or [] if g.get("id") == check.get("cites")]
+        if noted:
+            from .node import owner
+            ag = getattr(self.v2, "agent", None)
+            who = "manager" if self.ROLE == "building" else "owner"
+            live = [w for w in getattr(getattr(ag, "guard", None), "wishes", None) or [] if grounds.in_force(w, need["window_start"])]
+            words = dict.fromkeys((getattr(ag, "wish_notes", None) or {}).get(w["wish"]) for w in live)
+            facts = [{"id": "note", "says": f'The {who} wrote: "{x}"'} for x in words if x] + facts
+            text = owner.got_it(live, mean_kw(final), mean_kw(without), owner.when_of(need["window_start"], self.v2.now_ts()), fmt)
+            own = sum(kw_of(final)) < sum(kw_of(rule)) - 0.01            # less than the rule under the note too: that part is the model's own, with its own reason
+            told = self.tell(f"{text} {said}" if own and said and NO_REASON not in flags else text, point)
+            why = " ".join(x for x in (owner.says(live, who), why) if x)
+            flags = [*flags, owner.FOR_NOTE]
+        elif ans is not None and less and said and NO_REASON not in flags:
+            told = self.tell(f"I offered {fmt(mean_kw(final))} kW instead of {fmt(mean_kw(rule))} kW. {said}", point)
+        sl = need.get("slots") or []
+        self.receipt(point, asked={"event_id": need.get("event_id"), "window": [need.get("window_start"), need.get("window_end")], "kw_asked_per_half_hour": [x.get("kw_requested") for x in sl],
+                                   "price_usd_per_kwh": float(sl[0].get("price") or 0.0) if sl else None},
+                     rule={"kw_per_half_hour": kw_of(base), "what": "the planner's safe offer at the person's own limits" + (", without the note: a rule can't read one" if noted else ""),
+                           **({"with_the_note": kw_of(rule)} if noted else {})}, chose={"kw_per_half_hour": kw_of(final)},
+                     reason=why, facts=facts, flags=flags,
+                     by=f"rule: {NO_REASON}" if NO_REASON in flags else "agent" if ans is not None else "rule: fallback", less=less, told=told)
+
+    def before_note(self, eid: str, scale: Callable[[dict[str, Any]], dict[str, Any]]) -> dict[str, Any] | None:
+        """The rule's offer without a person's note: the safe offer before the note kept part of it out (home_v2.build_offer), at the same limits as the rule's."""
+        before = (getattr(self.v2, "before_note", None) or {}).get(eid) if all_agents() else None
+        return scale(before) if before else None
+
+    def decline_flags(self, ans: dict[str, Any] | None, check: dict[str, Any]) -> list[str]:
+        """Every node an agent: a decline with no reason, even asked again, gives way to the rule's yes. One whose fact doesn't hold stands, flagged."""
+        if not all_agents() or ans is None or ans.get("accept"):
+            return []
+        if not self.said(ans):
+            check.pop("overruled", None)
+            return [NO_REASON]
+        if check.get("overruled"):
+            check["no_fact"] = check.pop("overruled")
+            return [NO_FACT]
+        return []
+
+    def accept_receipt(self, c: dict[str, Any], kw: list[float], ans: dict[str, Any] | None, out: dict[str, Any], changed: list[dict[str, Any]], check: dict[str, Any],
+                       flags: list[str], routine: bool, fallback: bool) -> None:
+        declined = out.get("decision") == "DECLINED"
+        said = self.said(ans)
+        told = None
+        if declined and ans is not None and said:
+            told = self.tell(f"I declined the commitment of {sum(kw) / max(1, len(kw)):,.1f} kW. {said}", "commitment")
+        self.receipt("commitment", asked={"contract_id": c.get("id"), "event_id": c.get("event_id"), "kw_per_half_hour": kw, "changed_since_the_offer": [x["says"] for x in changed]},
+                     rule={"answer": "accept", "what": "inside the offer and safe"}, chose={"answer": "decline" if declined else "accept"},
+                     reason=NO_REASON if NO_REASON in flags else said if ans is not None else "the model did not answer: the rule's yes" if fallback else "",
+                     facts=[x for x in changed if x["id"] == check.get("cites")], flags=flags,
+                     by=f"rule: {NO_REASON}" if NO_REASON in flags else "agent" if ans is not None else "rule: fallback" if fallback else "rule", less=declined, told=told)
 
     def reset(self) -> None:
         """A new demo run replays the same days: forget the decisions (the owner's wishes and chat stay)."""
@@ -336,7 +472,7 @@ class HomeBrain:
         safe_kwh = offer["energy_kwh"]
         has_ev = any(s.get("ev_pause_kw", 0) > 0 for s in offer["slots"])
         t0 = time.perf_counter()
-        ans, meta = None, {"model": None, "ms": None, "error": None}
+        ans, meta, quiet = None, {"model": None, "ms": None, "error": None}, False
         if skip:
             meta["error"] = "the owner's wish decides"
         elif safe_kwh <= 0.01:
@@ -356,12 +492,20 @@ class HomeBrain:
             facts["safe_offer"]["other_devices_kw"] = (offer.get("appliances") or {}).get("by_device") or {}
             if not has_ev:
                 facts["safe_offer"]["note"] = "no EV pause possible in this window"
-            ans, meta = self.backend.decide("home", HOME_DECIDE, facts, OFFER_SCHEMA, budget_s=self.offer_budget_s,
-                                            session=f"{self.v2.name}-offer-{eid}")
-        fallback = ans is None
-        if fallback:                                  # plain Python values (safe_kwh may be a numpy float)
+            facts = grounds.honest(self.v2, facts, need, offer, w)
+            quiet = not facts["grounds"] and not all_agents()    # no fact on the list: no answer can change the offer, so nobody is asked. Every node an agent: always asked
+            if not quiet:
+                less = lambda a: (not a.get("take_part") or _num(a.get("battery_share"), 0.0, 1.0, 1.0) < float(w["battery_max_share"]) - 1e-9      # noqa: E731
+                                  or (has_ev and not w["no_ev_pause"] and not a.get("pause_ev")) or bool({str(x) for x in (a.get("devices_off") or [])} - set(w.get("devices_off") or [])))
+                ans, meta = self.decide_reasoned("home", HOME_DECIDE + grounds.RULE, facts, grounds.schema(OFFER_SCHEMA, facts), budget_s=self.offer_budget_s,
+                                                 session=f"{self.v2.name}-offer-{eid}", less=less)
+        fallback = ans is None and not quiet
+        if fallback:
+            self.fallbacks["offer"] += 1
+        check: dict[str, Any] = {}
+        if ans is None:                               # plain Python values (safe_kwh may be a numpy float)
             take, share, pause = bool(not skip and safe_kwh > 0.01), float(w["battery_max_share"]), bool(not w["no_ev_pause"])
-            reason = skip or ("rules: the planner's safe offer" + (f" ({meta['error']})" if meta.get("error") else ""))
+            reason = grounds.WHOLE if quiet else skip or ("rules: the planner's safe offer" + (f" ({meta['error']})" if meta.get("error") else ""))
             why_log = reason
         else:
             take = bool(ans.get("take_part"))
@@ -369,6 +513,19 @@ class HomeBrain:
             pause = bool(ans.get("pause_ev"))
             reason = str(ans.get("reason_for_owner") or "")[:400]
             why_log = str(ans.get("reason_for_log") or reason)[:400]
+            check = grounds.check_offer(ans, facts, not take or share < 0.999 or (has_ev and not pause) or bool(ans.get("devices_off")))
+            if all_agents():                          # every node an agent: nothing is overruled. A reason is required for less, and one with no fact is flagged (below)
+                if check.get("overruled"):
+                    check["no_fact"] = check.pop("overruled")
+            elif check.get("overruled"):                # a cut with no fact behind it doesn't stand: the safe offer is the default, and the reason stays on the record
+                take, share, pause, ans = True, 1.0, True, {**ans, "devices_off": []}
+                reason = (grounds.KEPT + reason)[:400]
+            else:
+                asked = ans.get("devices_off") if isinstance(ans.get("devices_off"), list) else []
+                take, cut, asked = grounds.held_to_fact(check, offer, take, {"battery": share, "car": float(pause)}, asked, set(getattr(self.v2.adapter, "app", None) or ()))
+                share, pause, ans = cut["battery"], bool(cut["car"]), {**ans, "devices_off": asked}
+                if "kept_whole" in check:
+                    reason = (grounds.KEPT_PART.format(", ".join(check["bears_on"])) + reason)[:400]
         # the guard: the owner's wishes after the LLM, always
         clamped = []
         if skip and take:
@@ -378,34 +535,124 @@ class HomeBrain:
         if pause and w["no_ev_pause"]:
             pause = False; clamped.append("owner's wish: keep the EV charging")
         have = set((getattr(self.v2.adapter, "app", None) or {}))
-        asked_off = ans.get("devices_off") if (not fallback and isinstance(ans.get("devices_off"), list)) else []
+        asked_off = ans.get("devices_off") if (ans is not None and isinstance(ans.get("devices_off"), list)) else []
         off = sorted(have & ({str(x) for x in asked_off} | set(w.get("devices_off") or [])))
         if have:
             self.v2.adapter.dev_off = set(off)
         final = scale_offer(drop_devices(offer, off), share, pause and has_ev, take)
+        self.safe[eid] = offer
+        rule = scale_offer(drop_devices(offer, sorted(have & set(w.get("devices_off") or []))), float(w["battery_max_share"]), has_ev and not w["no_ev_pause"], not skip)
+        flags: list[str] = []
+        if all_agents() and ans is not None and sum(kw_of(final)) < sum(kw_of(rule)) - 0.01:      # less than the rule's amount: it needs a reason
+            if not self.said(ans):                    # asked once more already: still none, so the rule's amount goes out
+                flags.append(NO_REASON)
+                take, share, pause, off, final = not skip, float(w["battery_max_share"]), bool(not w["no_ev_pause"]), sorted(have & set(w.get("devices_off") or [])), json.loads(json.dumps(rule))
+                if have:
+                    self.v2.adapter.dev_off = set(off)
+            elif not check.get("grounded"):
+                flags.append(NO_FACT)                 # it stands, flagged on the receipt
+        final["held_back_kw"] = held_back(rule, final)
         d = self.decisions.add(kind="offer", event_id=eid, sim=self.v2.now_ts(), take_part=take,
                                battery_share=round(share if take else 0.0, 2), pause_ev=bool(pause and has_ev and take),
                                safe_kw=[s["kw_offered"] for s in offer["slots"]], kw=[s["kw_offered"] for s in final["slots"]],
                                price=price, if_delivered_usd=round(final["energy_kwh"] * price, 2),
-                               reason=reason, reason_log=why_log, guard=clamped, fallback=fallback,
+                               reason=reason, reason_log=why_log, guard=clamped, fallback=fallback, routine=quiet, check=check, devices_off=off,
                                llm={"model": meta.get("llm_model") or meta.get("model"), "ms": meta.get("ms"), "error": meta.get("error"),
                                     "runtime": meta.get("runtime")})
         # what was decided goes out with the offer (signed with it): the coordinator keeps it, and the offline replay
         # of the event (verify.replay_total) applies the same decision with the same code
-        final["agent"] = {"decided_by": "rules" if fallback else "llm", "reason": reason[:300], "decision": d["n"],
+        final["agent"] = {"decided_by": "rules" if ans is None or NO_REASON in flags else "llm", "reason": reason[:300], "decision": d["n"],
                           "take_part": bool(take), "battery_share": float(share), "pause_ev": bool(pause and has_ev),
                           "devices_off": off}
         self.log("tool", tool="agent_decides_offer",
                  input=f"safe {' · '.join(f'{s:g}' for s in d['safe_kw'])} kW, ${price:.2f}/kWh, wishes "
                        f"{'skip' if skip else 'none' if w == DEFAULT_WISHES else 'set'}",
                  output=(f"{'takes part' if take else 'sits out'}: {' · '.join(f'{x:g}' for x in d['kw'])} kW "
-                         f"({'rules' if fallback else meta.get('model')}, {meta.get('ms') or 0} ms): {reason[:160]}"),
+                         f"({'rules' if ans is None else meta.get('model')}, {meta.get('ms') or 0} ms): {reason[:160]}"),
                  ms=round((time.perf_counter() - t0) * 1000, 1))
         self.log("agent_decision", what="offer", event_id=eid, take_part=take, kw=d["kw"], fallback=fallback,
                  reason=reason[:200])
+        final["agent"]["wishes"], final["agent"]["seen"] = grounds.stamp(w), grounds.seen(self.v2, w)
+        if all_agents():
+            final["agent"]["flags"] = flags
+            without = self.before_note(eid, lambda o: scale_offer(drop_devices(o, sorted(have & set(w.get("devices_off") or []))), float(w["battery_max_share"]),
+                                                                  any(s.get("ev_pause_kw", 0) > 0 for s in o["slots"]) and not w["no_ev_pause"], not skip))
+            self.offer_receipt("offer", need, rule, final, ans, check, flags, without=without)
         with self._lock:
             self._done[("offer", eid)] = final
         return final
+
+    # ---- decision 1b: the second round. The pool is short, and this home held something back. The model proposes again, code clamps: never below its first answer,
+    # never past the safe offer or the owner's limits. With no model the code's rule stands, as it does in the first round: the planner's safe offer
+    def raise_offer(self, need: dict[str, Any], more: dict[str, Any], offer: dict[str, Any]) -> dict[str, Any]:
+        eid = need["event_id"]
+        with self._lock:
+            if ("raise", eid) in self._done:
+                return self._done[("raise", eid)]
+        safe = self.safes(eid, offer)
+        if safe is None:
+            return offer
+        w, a = self.wishes.get(), offer.get("agent") or {}
+        have = set((getattr(self.v2.adapter, "app", None) or {}))
+        mine = have & set(w.get("devices_off") or [])
+        has_ev = any(s.get("ev_pause_kw", 0) > 0 for s in safe["slots"])
+        sl = need.get("slots") or []
+        price = float(sl[0].get("price") or 0.0) if sl else 0.0
+        kept = list((offer.get("held_back_kw") or {}).values())
+        first = {"take_part": a.get("take_part"), "battery_share": a.get("battery_share"), "pause_ev": a.get("pause_ev"), "devices_off": a.get("devices_off"), "reason": a.get("reason")}
+        facts = {**self._facts_common(), "request": {"event_id": eid, "window": f"{need['window_start'][11:]}-{need['window_end'][11:]}", "price_usd_per_kwh": price},
+                 "pool": pool_facts(need, more), "first_answer": first, "held_back_kw_per_half_hour": kept, "held_back_usd_if_delivered": round(sum(kept) * beckn.SLOT_MINUTES / 60 * price, 2),
+                 "safe_offer": {"energy_kwh": safe["energy_kwh"], "other_devices_kw": (safe.get("appliances") or {}).get("by_device") or {}},
+                 "forecast": self._fc_facts(self.forecasts.get(eid) or {}), "battery_at_window_start_kwh": (safe.get("battery") or {}).get("window_start_kwh")}
+        t0 = time.perf_counter()
+        rule = scale_offer(drop_devices(safe, sorted(mine)), float(w["battery_max_share"]), has_ev and not w["no_ev_pause"], True)
+        less = lambda x: sum(kw_of(scale_offer(drop_devices(safe, sorted(have & (({str(v) for v in (x.get("devices_off") or [])} & set(a.get("devices_off") or [])) | mine))),      # noqa: E731
+                                               min(float(w["battery_max_share"]), max(float(a.get("battery_share") or 0.0), _num(x.get("battery_share"), 0.0, 1.0, 1.0))),
+                                               (bool(a.get("pause_ev")) or bool(x.get("pause_ev"))) and not w["no_ev_pause"] and has_ev, True))) < sum(kw_of(rule)) - 0.01
+        ans, meta = self.decide_reasoned("home", HOME_RAISE, facts, OFFER_SCHEMA, budget_s=self.offer_budget_s, session=f"{self.v2.name}-raise-{eid}", less=less)
+        fallback = ans is None
+        if fallback:
+            self.fallbacks["offer_raise"] += 1
+        if fallback:
+            share, pause, off = float(w["battery_max_share"]), not w["no_ev_pause"], sorted(mine)
+            reason = "rules: the planner's safe offer" + (f" ({meta['error']})" if meta.get("error") else "")
+        else:
+            share = max(float(a.get("battery_share") or 0.0), _num(ans.get("battery_share"), 0.0, 1.0, 1.0))
+            pause = bool(a.get("pause_ev")) or bool(ans.get("pause_ev"))
+            asked = ans.get("devices_off") if isinstance(ans.get("devices_off"), list) else []
+            off = sorted(have & (({str(x) for x in asked} & set(a.get("devices_off") or [])) | mine))
+            reason = str(ans.get("reason_for_owner") or "")[:400]
+        share, pause = min(share, float(w["battery_max_share"])), pause and not w["no_ev_pause"]
+        if have:
+            self.v2.adapter.dev_off = set(off)
+        final = scale_offer(drop_devices(safe, off), share, pause and has_ev, True)
+        flags: list[str] = []
+        if all_agents() and not fallback and sum(kw_of(final)) < sum(kw_of(rule)) - 0.01:          # still less than the rule's amount: it needs a reason
+            if not self.said(ans):
+                flags.append(NO_REASON)
+                share, pause, off, final = float(w["battery_max_share"]), not w["no_ev_pause"], sorted(mine), json.loads(json.dumps(rule))
+                if have:
+                    self.v2.adapter.dev_off = set(off)
+            elif str(ans.get("cut_fact") or "none") == "none":
+                flags.append(NO_FACT)
+        final["held_back_kw"] = held_back(rule, final)
+        d = self.decisions.add(kind="offer_raise", event_id=eid, sim=self.v2.now_ts(), battery_share=round(share, 2), pause_ev=bool(pause and has_ev), kw_first=[s["kw_offered"] for s in offer["slots"]],
+                               kw=[s["kw_offered"] for s in final["slots"]], price=price, reason=reason, fallback=fallback,
+                               llm={"model": meta.get("llm_model") or meta.get("model"), "ms": meta.get("ms"), "error": meta.get("error"), "runtime": meta.get("runtime")})
+        final["agent"] = {"decided_by": "rules" if fallback or NO_REASON in flags else "llm", "reason": reason[:300], "decision": d["n"], "round": 2, "take_part": True, "battery_share": float(share),
+                          "pause_ev": bool(pause and has_ev), "devices_off": off, "seen": a.get("seen")}
+        self.log("agent_decision", what="offer_raise", event_id=eid, kw=d["kw"], fallback=fallback, reason=reason[:200], ms=round((time.perf_counter() - t0) * 1000, 1))
+        if all_agents():
+            final["agent"]["flags"] = flags
+            self.offer_receipt("offer_raise", need, rule, final, ans, {}, flags)
+        with self._lock:
+            self._done[("raise", eid)] = self._done[("offer", eid)] = final
+        return final
+
+    def safes(self, eid: str, offer: dict[str, Any]) -> dict[str, Any] | None:
+        """The planner's offer behind this one, if the agent held any of it back."""
+        safe = self.safe.get(eid)
+        return safe if safe is not None and max((float(v) for v in (offer.get("held_back_kw") or {}).values()), default=0.0) >= 0.05 else None
 
     # ---- decision 2: the commitment
     def decide_accept(self, c: dict[str, Any], verdict: dict[str, Any]) -> dict[str, Any]:
@@ -425,9 +672,13 @@ class HomeBrain:
         usd = round(sum(kw) * beckn.SLOT_MINUTES / 60 * price, 2)
         t0 = time.perf_counter()
         ans, meta = None, {"model": None, "ms": None, "error": None}
+        if getattr(self.v2, "agent", None) is not None:           # a note that came in since: what the model reads in it is what changed
+            self.v2.agent.read_note(self.v2.now_ts())
+        changed = grounds.since_offer(self.v2, offer, self.wishes.get(), str(c.get("window_start", "")), price)
+        routine = not skip and not changed and not all_agents()      # inside the offer with nothing new since: there is no question to ask, so code answers and records it. Every node an agent: asked
         if skip:
             meta["error"] = "the owner's wish decides"
-        else:
+        elif not routine:
             facts = {**self._facts_common(),
                      "commitment": {"event_id": c.get("event_id"), "window": f"{str(c.get('window_start', ''))[11:]}"
                                     f"-{str(c.get('window_end', ''))[11:]}", "per_half_hour_kw": kw,
@@ -435,22 +686,27 @@ class HomeBrain:
                                     "opt_out_by": c.get("opt_out_by")},
                      "our_offer_kw": [s.get("kw_offered") for s in offer.get("slots", [])],
                      "why_we_offered": (offer.get("agent") or {}).get("reason"),
-                     "safety_check": verdict.get("reason")}
-            ans, meta = self.backend.decide("home", HOME_ACCEPT, facts, ACCEPT_SCHEMA, budget_s=self.accept_budget_s,
-                                            session=f"{self.v2.name}-accept-{cid}")
-        fallback = ans is None
+                     "safety_check": verdict.get("reason"), "changed_since_the_offer": [f'{x["id"]}: {x["says"]}' for x in changed]}
+            ans, meta = self.decide_reasoned("home", HOME_ACCEPT, facts, grounds.decline_schema(ACCEPT_SCHEMA, changed), budget_s=self.accept_budget_s,
+                                             session=f"{self.v2.name}-accept-{cid}", less=lambda a: not a.get("accept"))
+        fallback = ans is None and not routine
+        if fallback:
+            self.fallbacks["accept"] += 1
+        check = grounds.check_decline(ans, changed, offer) if ans is not None and not ans.get("accept") else {}
+        flags = self.decline_flags(ans, check)
         if skip:
             out = {"decision": "DECLINED", "reason": "homeowner_opted_out", "contract_id": cid}
             reason = skip
-        elif fallback or bool(ans.get("accept")):
+        elif routine or fallback or bool(ans.get("accept")) or check.get("overruled") or NO_REASON in flags:
             out = verdict
-            reason = "rules: within the offer and safe" if fallback else str(ans.get("reason_for_owner") or "")[:400]
+            said = "" if ans is None else str(ans.get("reason_for_owner") or "")
+            reason = "code: inside the offer, and nothing changed since" if routine else "rules: within the offer and safe" if fallback else (grounds.KEPT_YES + said)[:400] if check.get("overruled") else said[:400]
         else:
             out = {"decision": "DECLINED", "reason": "agent_declined", "contract_id": cid}
             reason = str(ans.get("reason_for_owner") or "")[:400]
         self.decisions.add(kind="accept", event_id=c.get("event_id"), contract_id=cid, sim=self.v2.now_ts(),
                            accept=out["decision"] == "ACCEPTED", decision=out["decision"], kw=kw, price=price,
-                           if_delivered_usd=usd, reason=reason, fallback=fallback,
+                           if_delivered_usd=usd, reason=reason, fallback=fallback, routine=routine, check=check,
                            llm={"model": meta.get("llm_model") or meta.get("model"), "ms": meta.get("ms"), "error": meta.get("error"),
                                     "runtime": meta.get("runtime")})
         self.log("tool", tool="agent_decides_commitment",
@@ -459,6 +715,8 @@ class HomeBrain:
                  ms=round((time.perf_counter() - t0) * 1000, 1))
         self.log("agent_decision", what="accept", contract_id=cid, decision=out["decision"], fallback=fallback,
                  reason=reason[:200])
+        if all_agents():
+            self.accept_receipt(c, kw, ans, out, changed, check, flags, routine, fallback)
         with self._lock:
             self._done[("accept", cid)] = out
         return out
@@ -530,7 +788,7 @@ class HomeBrain:
             if ctl is None:
                 return {"real_time": False, "note": "this home runs today's fixed plan: it cannot change it during the day"}
             lim = ctl.limits
-            comfort = (a.overrides or {}).get("comfort") or {}
+            comfort = (a.overrides or {}).get("comfort_limit") or {}
             return {"real_time": True, "time": v2.now_ts(), "owes_now_kw": tel.get("owed_kw"),
                     "extra_dispatched_kw": tel.get("rt_extra_kw"), "indoor_c_above_own_day": tel.get("t_dev_c"),
                     "comfort_limit_c": comfort.get("max_rise_c", lim.max_rise_c),
@@ -695,7 +953,7 @@ class FacilityPolicy(Wishes):
         self.lock = threading.Lock()
         try:
             w = {**DEFAULT_POLICY, **json.loads(path.read_text())}
-        except (OSError, ValueError):
+        except (OSError, ValueError, TypeError, RecursionError):
             w = json.loads(json.dumps(DEFAULT_POLICY))
         self.w = {k: w.get(k, v) for k, v in DEFAULT_POLICY.items()}
 
@@ -783,16 +1041,28 @@ temperature may rise within the facility manager's comfort limit), dimming part 
 manager's dimming limit), and its other smart systems, listed under "devices" (ventilation fans within the fresh-air minimum,
 plug loads, EV ports). You decide how much of it to offer: take part or not, the share of the cooling part
 (0 to 1), the share of the lighting part (0 to 1), and any devices to leave out, named in devices_off. You can only
-lower the safe offer; the building's code enforces every limit and the manager's policy after you. Promising more
-than the building delivers costs reputation and future income, so offer less of the cooling when the evening's
-weather forecast is uncertain or the building will be busy, and keep the lighting that people need to read and move
-safely; offer fully when it is safe and worth it. Reasons: one or two plain sentences with the numbers that mattered."""
+lower the safe offer; the building's code enforces every limit and the manager's policy after you. Only what the meter
+shows is paid, so a promise the building doesn't keep earns nothing, but the safe offer already has the manager's comfort limit, the dimming limit
+and the fresh-air minimum inside it, and 20 % off the cooling and the devices and 5 % off the lighting for forecast error, so heat, a busy evening
+and forecast uncertainty are allowed for. Offer less only for a fact the planner can't see: the manager's policy or words, an event in the building,
+equipment out of service. Otherwise offer fully. Reasons: one or two plain sentences with the numbers that mattered."""
+
+BUILDING_RAISE = """You are the AI energy agent of a large public building that is a node in a FlexGrid community in Massachusetts. You already
+offered part of the building's safe offer for this evening. All the offers together are now short of what the buyers ordered and of the reserve kept
+behind it, so the community asks the homes and buildings that held something back whether they can give more, at the same price per kWh delivered. The
+facts say how much is missing and how much you held back. The safe offer is not a wish: the building's planner worked it out from the forecast, with the
+manager's comfort limit, the dimming limit and the fresh-air minimum inside it, and took 20 % off the cooling and the devices and 5 % off the lighting for
+forecast error. The building's code and its 5-minute controller stop at those limits whatever you offer. So heat, a busy evening and forecast uncertainty
+are already allowed for. Keep something back only for a fact the planner can't see: the manager's policy or words, an event in the building, equipment
+out of service. Otherwise raise the shares of the cooling and the lighting to 1 and name no device in devices_off. Your shares can only go up from your
+first answer. Reasons: one or two plain sentences with the numbers that mattered."""
 
 BUILDING_ACCEPT = """You are the AI energy agent of a large public building in a FlexGrid community. The coordinator has
 sent the building its share of the community's commitment. The building's trust guard has already checked it is
-within your offer and safe. Accept unless something changed since the offer that makes it unwise (the facility
-manager's policy or words, a much hotter evening than forecast). Declining costs the community and the building's
-reputation. One or two plain sentences."""
+within your offer and safe, and it asks you because something changed since the offer: see changed_since_the_offer.
+Accept unless that makes it unwise. A building that declines is replaced from spare offers if there are any, and the sale can fall short by its part.
+To decline, put the id of the change in decline_fact: a decline stands only on a change that bears on nearly all of the offer. Otherwise accept, and the building gives what it can.
+One or two plain sentences."""
 
 BUILDING_CHAT = """You are the AI energy agent of {home} ({label}), a large public library that is a building node in a
 FlexGrid community in Massachusetts. You talk with the building's facility manager. FlexGrid pays for using less
@@ -840,14 +1110,8 @@ class BuildingBrain(HomeBrain):
                                  "reputation": round(self.v2.reputation, 3)}}
 
     def _weather(self, need: dict[str, Any]) -> dict[str, Any]:
-        """The forecast outdoor temperature over the window (as issued: fc_temp_c), and today's so far."""
-        rp = self.v2.replay
-        try:
-            w0, w1 = rp.idx_of(need["window_start"]), rp.idx_of(need["window_end"])
-            fc = [float(rp.row(k).get("fc_temp_c", rp.row(k)["temp_c"])) for k in range(w0, w1)]
-            return {"window_forecast_c": {"min": round(min(fc), 1), "max": round(max(fc), 1)}} if fc else {}
-        except Exception:                                  # noqa: BLE001  a window outside the dataset
-            return {}
+        """The forecast outdoor temperature over the window (as issued: fc_temp_c), as a series: as a min and a max it read as doubt, in every prompt that had it."""
+        return grounds.weather_words(self.v2, need)
 
     # ---- decision 1: the offer
     def decide_offer(self, need: dict[str, Any], fc: dict[str, Any], offer: dict[str, Any]) -> dict[str, Any]:
@@ -864,7 +1128,7 @@ class BuildingBrain(HomeBrain):
                                           f"${w['min_price_usd_per_kwh']:.2f}" if price < w["min_price_usd_per_kwh"] else None)
         safe_kwh = offer["energy_kwh"]
         t0 = time.perf_counter()
-        ans, meta = None, {"model": None, "ms": None, "error": None}
+        ans, meta, quiet = None, {"model": None, "ms": None, "error": None}, False
         ac, li = offer.get("air_conditioning") or {}, offer.get("lighting") or {}
         if skip:
             meta["error"] = "the facility manager's policy decides"
@@ -883,13 +1147,22 @@ class BuildingBrain(HomeBrain):
                                     "cooling_forecast_in_window_kw": ac.get("cooling_forecast_kw"),
                                     "lighting_on_in_window_kw": li.get("lighting_on_kw")},
                      "forecast": {**self._fc_facts(fc), **self._weather(need)}}
-            ans, meta = self.backend.decide("building", BUILDING_DECIDE, facts, BUILDING_OFFER_SCHEMA,
-                                            budget_s=self.offer_budget_s, session=f"{self.v2.name}-offer-{eid}")
-        fallback = ans is None
+            facts = grounds.honest(self.v2, facts, need, offer, w)
+            quiet = not facts["grounds"] and not all_agents()    # no fact on the list: no answer can change the offer, so nobody is asked. Every node an agent: always asked
+            if not quiet:
+                less = lambda a: (not a.get("take_part") or _num(a.get("cooling_share"), 0.0, 1.0, 1.0) < float(w["cooling_max_share"]) - 1e-9      # noqa: E731
+                                  or _num(a.get("lighting_share"), 0.0, 1.0, 1.0) < float(w["lighting_max_share"]) - 1e-9
+                                  or bool({str(x) for x in (a.get("devices_off") or [])} - set(w.get("devices_off") or [])))
+                ans, meta = self.decide_reasoned("building", BUILDING_DECIDE + grounds.RULE, facts, grounds.schema(BUILDING_OFFER_SCHEMA, facts),
+                                                 budget_s=self.offer_budget_s, session=f"{self.v2.name}-offer-{eid}", less=less)
+        fallback = ans is None and not quiet
         if fallback:
+            self.fallbacks["offer"] += 1
+        check: dict[str, Any] = {}
+        if ans is None:
             take = bool(not skip and safe_kwh > 0.01)
             cs, ls = float(w["cooling_max_share"]), float(w["lighting_max_share"])
-            reason = skip or ("rules: the planner's safe offer" + (f" ({meta['error']})" if meta.get("error") else ""))
+            reason = grounds.WHOLE if quiet else skip or ("rules: the planner's safe offer" + (f" ({meta['error']})" if meta.get("error") else ""))
             why_log = reason
         else:
             take = bool(ans.get("take_part"))
@@ -897,6 +1170,19 @@ class BuildingBrain(HomeBrain):
             ls = _num(ans.get("lighting_share"), 0.0, 1.0, 1.0)
             reason = str(ans.get("reason_for_manager") or "")[:400]
             why_log = str(ans.get("reason_for_log") or reason)[:400]
+            check = grounds.check_offer(ans, facts, not take or cs < 0.999 or ls < 0.999 or bool(ans.get("devices_off")))
+            if all_agents():                          # every node an agent: nothing is overruled. A reason is required for less, and one with no fact is flagged (below)
+                if check.get("overruled"):
+                    check["no_fact"] = check.pop("overruled")
+            elif check.get("overruled"):                # a cut with no fact behind it doesn't stand: the safe offer is the default, and the reason stays on the record
+                take, cs, ls, ans = True, 1.0, 1.0, {**ans, "devices_off": []}
+                reason = (grounds.KEPT + reason)[:400]
+            else:
+                asked = ans.get("devices_off") if isinstance(ans.get("devices_off"), list) else []
+                take, cut, asked = grounds.held_to_fact(check, offer, take, {"cooling": cs, "lighting": ls}, asked, set(getattr(self.v2.adapter, "app", None) or ()))
+                cs, ls, ans = cut["cooling"], cut["lighting"], {**ans, "devices_off": asked}
+                if "kept_whole" in check:
+                    reason = (grounds.KEPT_PART.format(", ".join(check["bears_on"])) + reason)[:400]
         clamped = []                                  # the guard: the manager's policy after the LLM, always
         if skip and take:
             take = False; clamped.append("facility manager's policy: skip")
@@ -905,32 +1191,116 @@ class BuildingBrain(HomeBrain):
         if ls > w["lighting_max_share"] + 1e-9:
             ls = w["lighting_max_share"]; clamped.append(f"lighting share capped at the manager's {w['lighting_max_share']:.0%}")
         have = set((getattr(self.v2.adapter, "app", None) or {}))
-        asked_off = ans.get("devices_off") if (not fallback and isinstance(ans.get("devices_off"), list)) else []
+        asked_off = ans.get("devices_off") if (ans is not None and isinstance(ans.get("devices_off"), list)) else []
         off = sorted(have & ({str(x) for x in asked_off} | set(w.get("devices_off") or [])))
         if have:
             self.v2.adapter.dev_off = set(off)
         final = scale_building_offer(drop_devices(offer, off), cs, ls, take)
+        self.safe[eid] = offer
+        rule = scale_building_offer(drop_devices(offer, sorted(have & set(w.get("devices_off") or []))), float(w["cooling_max_share"]), float(w["lighting_max_share"]), not skip)
+        flags: list[str] = []
+        if all_agents() and ans is not None and sum(kw_of(final)) < sum(kw_of(rule)) - 0.01:      # less than the rule's amount: it needs a reason
+            if not self.said(ans):                    # asked once more already: still none, so the rule's amount goes out
+                flags.append(NO_REASON)
+                take, cs, ls, off, final = not skip, float(w["cooling_max_share"]), float(w["lighting_max_share"]), sorted(have & set(w.get("devices_off") or [])), json.loads(json.dumps(rule))
+                if have:
+                    self.v2.adapter.dev_off = set(off)
+            elif not check.get("grounded"):
+                flags.append(NO_FACT)                 # it stands, flagged on the receipt
+        final["held_back_kw"] = held_back(rule, final)
         d = self.decisions.add(kind="offer", event_id=eid, sim=self.v2.now_ts(), take_part=take, node="building",
                                cooling_share=round(cs if take else 0.0, 2), lighting_share=round(ls if take else 0.0, 2),
                                safe_kw=[s["kw_offered"] for s in offer["slots"]], kw=[s["kw_offered"] for s in final["slots"]],
                                cooling_kw=[s.get("ac_kw", 0.0) for s in final["slots"]],
                                lighting_kw=[s.get("light_kw", 0.0) for s in final["slots"]],
                                price=price, if_delivered_usd=round(final["energy_kwh"] * price, 2),
-                               reason=reason, reason_log=why_log, guard=clamped, fallback=fallback,
+                               reason=reason, reason_log=why_log, guard=clamped, fallback=fallback, routine=quiet, check=check, devices_off=off,
                                llm={"model": meta.get("llm_model") or meta.get("model"), "ms": meta.get("ms"),
                                     "error": meta.get("error"), "runtime": meta.get("runtime")})
-        final["agent"] = {"decided_by": "rules" if fallback else "llm", "reason": reason[:300], "decision": d["n"],
-                          "take_part": bool(take), "cooling_share": float(cs), "lighting_share": float(ls)}
+        final["agent"] = {"decided_by": "rules" if ans is None or NO_REASON in flags else "llm", "reason": reason[:300], "decision": d["n"],
+                          "take_part": bool(take), "cooling_share": float(cs), "lighting_share": float(ls), "devices_off": off}
         self.log("tool", tool="agent_decides_offer",
                  input=f"safe {' · '.join(f'{s:g}' for s in d['safe_kw'])} kW (cooling + lighting), ${price:.2f}/kWh",
                  output=(f"{'takes part' if take else 'sits out'}: {' · '.join(f'{x:g}' for x in d['kw'])} kW, cooling "
-                         f"{cs:.0%}, lighting {ls:.0%} ({'rules' if fallback else meta.get('model')}, "
+                         f"{cs:.0%}, lighting {ls:.0%} ({'rules' if ans is None else meta.get('model')}, "
                          f"{meta.get('ms') or 0} ms): {reason[:160]}"),
                  ms=round((time.perf_counter() - t0) * 1000, 1))
         self.log("agent_decision", what="offer", event_id=eid, take_part=take, kw=d["kw"], fallback=fallback,
                  reason=reason[:200])
+        final["agent"]["wishes"], final["agent"]["seen"] = grounds.stamp(w), grounds.seen(self.v2, w)
+        if all_agents():
+            final["agent"]["flags"] = flags
+            without = self.before_note(eid, lambda o: scale_building_offer(drop_devices(o, sorted(have & set(w.get("devices_off") or []))), float(w["cooling_max_share"]),
+                                                                           float(w["lighting_max_share"]), not skip))
+            self.offer_receipt("offer", need, rule, final, ans, check, flags, fmt=lambda x: f"{x:,.0f}", without=without)
         with self._lock:
             self._done[("offer", eid)] = final
+        return final
+
+    # ---- decision 1b: the second round, over a building's levers
+    def raise_offer(self, need: dict[str, Any], more: dict[str, Any], offer: dict[str, Any]) -> dict[str, Any]:
+        eid = need["event_id"]
+        with self._lock:
+            if ("raise", eid) in self._done:
+                return self._done[("raise", eid)]
+        safe = self.safes(eid, offer)
+        if safe is None:
+            return offer
+        w, a = self.wishes.get(), offer.get("agent") or {}
+        have = set((getattr(self.v2.adapter, "app", None) or {}))
+        mine = have & set(w.get("devices_off") or [])
+        sl = need.get("slots") or []
+        price = float(sl[0].get("price") or 0.0) if sl else 0.0
+        kept = list((offer.get("held_back_kw") or {}).values())
+        ac, li = safe.get("air_conditioning") or {}, safe.get("lighting") or {}
+        first = {"take_part": a.get("take_part"), "cooling_share": a.get("cooling_share"), "lighting_share": a.get("lighting_share"), "devices_off": a.get("devices_off"), "reason": a.get("reason")}
+        facts = {**self._facts_common(), "request": {"event_id": eid, "window": f"{need['window_start'][11:]}-{need['window_end'][11:]}", "price_usd_per_kwh": price},
+                 "pool": pool_facts(need, more), "first_answer": first, "held_back_kw_per_half_hour": kept, "held_back_usd_if_delivered": round(sum(kept) * beckn.SLOT_MINUTES / 60 * price, 2),
+                 "safe_offer": {"cooling_kw": ac.get("kw"), "lighting_kw": li.get("kw"), "devices_kw": (safe.get("appliances") or {}).get("by_device") or {}, "energy_kwh": safe["energy_kwh"]},
+                 "forecast": {**self._fc_facts(self.forecasts.get(eid) or {}), **self._weather(need)}}
+        t0 = time.perf_counter()
+        rule = scale_building_offer(drop_devices(safe, sorted(mine)), float(w["cooling_max_share"]), float(w["lighting_max_share"]), True)
+        less = lambda x: sum(kw_of(scale_building_offer(drop_devices(safe, sorted(have & (({str(v) for v in (x.get("devices_off") or [])} & set(a.get("devices_off") or [])) | mine))),      # noqa: E731
+                                                        min(float(w["cooling_max_share"]), max(float(a.get("cooling_share") or 0.0), _num(x.get("cooling_share"), 0.0, 1.0, 1.0))),
+                                                        min(float(w["lighting_max_share"]), max(float(a.get("lighting_share") or 0.0), _num(x.get("lighting_share"), 0.0, 1.0, 1.0))), True))) < sum(kw_of(rule)) - 0.01
+        ans, meta = self.decide_reasoned("building", BUILDING_RAISE, facts, BUILDING_OFFER_SCHEMA, budget_s=self.offer_budget_s, session=f"{self.v2.name}-raise-{eid}", less=less)
+        fallback = ans is None
+        if fallback:
+            self.fallbacks["offer_raise"] += 1
+        if fallback:
+            cs, ls, off = float(w["cooling_max_share"]), float(w["lighting_max_share"]), sorted(mine)
+            reason = "rules: the planner's safe offer" + (f" ({meta['error']})" if meta.get("error") else "")
+        else:
+            cs = max(float(a.get("cooling_share") or 0.0), _num(ans.get("cooling_share"), 0.0, 1.0, 1.0))
+            ls = max(float(a.get("lighting_share") or 0.0), _num(ans.get("lighting_share"), 0.0, 1.0, 1.0))
+            asked = ans.get("devices_off") if isinstance(ans.get("devices_off"), list) else []
+            off = sorted(have & (({str(x) for x in asked} & set(a.get("devices_off") or [])) | mine))
+            reason = str(ans.get("reason_for_manager") or "")[:400]
+        cs, ls = min(cs, float(w["cooling_max_share"])), min(ls, float(w["lighting_max_share"]))
+        if have:
+            self.v2.adapter.dev_off = set(off)
+        final = scale_building_offer(drop_devices(safe, off), cs, ls, True)
+        flags: list[str] = []
+        if all_agents() and not fallback and sum(kw_of(final)) < sum(kw_of(rule)) - 0.01:          # still less than the rule's amount: it needs a reason
+            if not self.said(ans):
+                flags.append(NO_REASON)
+                cs, ls, off, final = float(w["cooling_max_share"]), float(w["lighting_max_share"]), sorted(mine), json.loads(json.dumps(rule))
+                if have:
+                    self.v2.adapter.dev_off = set(off)
+            elif str(ans.get("cut_fact") or "none") == "none":
+                flags.append(NO_FACT)
+        final["held_back_kw"] = held_back(rule, final)
+        d = self.decisions.add(kind="offer_raise", event_id=eid, sim=self.v2.now_ts(), node="building", cooling_share=round(cs, 2), lighting_share=round(ls, 2), kw_first=[s["kw_offered"] for s in offer["slots"]],
+                               kw=[s["kw_offered"] for s in final["slots"]], price=price, reason=reason, fallback=fallback,
+                               llm={"model": meta.get("llm_model") or meta.get("model"), "ms": meta.get("ms"), "error": meta.get("error"), "runtime": meta.get("runtime")})
+        final["agent"] = {"decided_by": "rules" if fallback or NO_REASON in flags else "llm", "reason": reason[:300], "decision": d["n"], "round": 2, "take_part": True, "cooling_share": float(cs), "lighting_share": float(ls), "devices_off": off,
+                          "seen": a.get("seen")}
+        self.log("agent_decision", what="offer_raise", event_id=eid, kw=d["kw"], fallback=fallback, reason=reason[:200], ms=round((time.perf_counter() - t0) * 1000, 1))
+        if all_agents():
+            final["agent"]["flags"] = flags
+            self.offer_receipt("offer_raise", need, rule, final, ans, {}, flags, fmt=lambda x: f"{x:,.0f}")
+        with self._lock:
+            self._done[("raise", eid)] = self._done[("offer", eid)] = final
         return final
 
     # ---- decision 2: the commitment
@@ -951,31 +1321,40 @@ class BuildingBrain(HomeBrain):
         usd = round(sum(kw) * beckn.SLOT_MINUTES / 60 * price, 2)
         t0 = time.perf_counter()
         ans, meta = None, {"model": None, "ms": None, "error": None}
+        if getattr(self.v2, "agent", None) is not None:           # a note that came in since: what the model reads in it is what changed
+            self.v2.agent.read_note(self.v2.now_ts())
+        changed = grounds.since_offer(self.v2, offer, self.wishes.get(), str(c.get("window_start", "")), price)
+        routine = not skip and not changed and not all_agents()      # inside the offer with nothing new since: there is no question to ask, so code answers and records it. Every node an agent: asked
         if skip:
             meta["error"] = "the facility manager's policy decides"
-        else:
+        elif not routine:
             facts = {**self._facts_common(),
                      "commitment": {"event_id": c.get("event_id"), "window": f"{str(c.get('window_start', ''))[11:]}"
                                     f"-{str(c.get('window_end', ''))[11:]}", "per_half_hour_kw": kw,
                                     "price_usd_per_kwh": price, "if_delivered_usd": usd, "opt_out_by": c.get("opt_out_by")},
                      "our_offer_kw": [s.get("kw_offered") for s in offer.get("slots", [])],
                      "why_we_offered": (offer.get("agent") or {}).get("reason"),
-                     "safety_check": verdict.get("reason"), **self._weather(need or c)}
-            ans, meta = self.backend.decide("building", BUILDING_ACCEPT, facts, BUILDING_ACCEPT_SCHEMA,
-                                            budget_s=self.accept_budget_s, session=f"{self.v2.name}-accept-{cid}")
-        fallback = ans is None
+                     "safety_check": verdict.get("reason"), "changed_since_the_offer": [f'{x["id"]}: {x["says"]}' for x in changed], **self._weather(need or c)}
+            ans, meta = self.decide_reasoned("building", BUILDING_ACCEPT, facts, grounds.decline_schema(BUILDING_ACCEPT_SCHEMA, changed),
+                                             budget_s=self.accept_budget_s, session=f"{self.v2.name}-accept-{cid}", less=lambda a: not a.get("accept"))
+        fallback = ans is None and not routine
+        if fallback:
+            self.fallbacks["accept"] += 1
+        check = grounds.check_decline(ans, changed, offer) if ans is not None and not ans.get("accept") else {}
+        flags = self.decline_flags(ans, check)
         if skip:
             out = {"decision": "DECLINED", "reason": "facility_manager_opted_out", "contract_id": cid}
             reason = skip
-        elif fallback or bool(ans.get("accept")):
+        elif routine or fallback or bool(ans.get("accept")) or check.get("overruled") or NO_REASON in flags:
             out = verdict
-            reason = "rules: within the offer and safe" if fallback else str(ans.get("reason_for_manager") or "")[:400]
+            said = "" if ans is None else str(ans.get("reason_for_manager") or "")
+            reason = "code: inside the offer, and nothing changed since" if routine else "rules: within the offer and safe" if fallback else (grounds.KEPT_YES + said)[:400] if check.get("overruled") else said[:400]
         else:
             out = {"decision": "DECLINED", "reason": "agent_declined", "contract_id": cid}
             reason = str(ans.get("reason_for_manager") or "")[:400]
         self.decisions.add(kind="accept", event_id=c.get("event_id"), contract_id=cid, sim=self.v2.now_ts(),
                            accept=out["decision"] == "ACCEPTED", decision=out["decision"], kw=kw, price=price,
-                           if_delivered_usd=usd, reason=reason, fallback=fallback, node="building",
+                           if_delivered_usd=usd, reason=reason, fallback=fallback, routine=routine, check=check, node="building",
                            llm={"model": meta.get("llm_model") or meta.get("model"), "ms": meta.get("ms"),
                                 "error": meta.get("error"), "runtime": meta.get("runtime")})
         self.log("tool", tool="agent_decides_commitment",
@@ -984,6 +1363,8 @@ class BuildingBrain(HomeBrain):
                  ms=round((time.perf_counter() - t0) * 1000, 1))
         self.log("agent_decision", what="accept", contract_id=cid, decision=out["decision"], fallback=fallback,
                  reason=reason[:200])
+        if all_agents():
+            self.accept_receipt(c, kw, ans, out, changed, check, flags, routine, fallback)
         with self._lock:
             self._done[("accept", cid)] = out
         return out
@@ -1007,14 +1388,14 @@ class BuildingBrain(HomeBrain):
             ctl = getattr(a, "ctl", None)
             tel = a.tel or {}
             ov = a.overrides or {}
-            comfort = ov.get("comfort") or {}
+            comfort = ov.get("comfort_limit") or {}
             lim = ctl.limits
             return {"real_time": True, "time": v2.now_ts(), "owes_now_kw": tel.get("owed_kw"),
                     "extra_dispatched_kw": tel.get("rt_extra_kw"), "lighting_dimmed_kw": tel.get("light_dim_kw"),
                     "indoor_c_above_own_day": tel.get("t_dev_c"),
                     "comfort_limit_open_c": comfort.get("max_rise_c", lim.max_rise_c),
                     "comfort_limit_closed_c": comfort.get("max_rise_away_c", lim.max_rise_away_c),
-                    "lights_dim_max_share": a.dim_max(), "left_the_event": bool(ov.get("stop")),
+                    "lights_dim_max_share": a.light_limit(), "left_the_event": bool(ov.get("stop")),
                     "short_reported_kw": max((getattr(v2, "_rt_reported", {}) or {}).values(), default=0.0)}
 
         def set_comfort_limit(add_c: float):
@@ -1026,10 +1407,10 @@ class BuildingBrain(HomeBrain):
 
         def set_light_limit(share: float):
             from .building import LIGHT_DIM_HARD_MAX
-            sh = _num(share, 0.0, LIGHT_DIM_HARD_MAX, a.dim_max())
+            sh = _num(share, 0.0, LIGHT_DIM_HARD_MAX, a.light_limit())
             a.rt_override("lights", sh)
             self.log("owner_override", override="lights", value=sh, source="chat")
-            return {"applied": True, "lights_dim_max_share": a.dim_max(),
+            return {"applied": True, "lights_dim_max_share": a.light_limit(),
                     "note": f"never more than {LIGHT_DIM_HARD_MAX:.0%} of what is on; 0 keeps every light on"}
 
         def leave_event(on: bool = True):
@@ -1113,8 +1494,8 @@ COORD_DECIDE = """You are the AI agent of a FlexGrid community coordinator. 100 
 buyer's request. The clearing (math) will ask the homes for more than it sells: the margin covers homes that deliver
 less than they offered. You choose that margin between 0.05 and 0.30 (default 0.10). A bigger margin can sell less
 (less income now) but keeps the promise on uncertain days; a smaller one risks a shortfall, which costs the
-community's reputation and future income. The facts' sell_by_margin gives, for each margin, what would be sold, what
-it earns if delivered and how much the homes would be asked for: when the offers are far above the request, a bigger
+community's reputation and future income. The facts' sell_by_margin gives, for each margin, what would be sold, the
+most it can earn if delivered and how much the homes would be asked for: when the offers are far above the request, a bigger
 margin sells the same and only asks the homes for more, a safer promise at no cost. Use it, the offers' mix (EV pauses
 are less sure than batteries), the homes' confidence and the track record. One or two plain sentences, with the numbers
 that mattered."""

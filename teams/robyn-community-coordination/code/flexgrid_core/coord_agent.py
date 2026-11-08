@@ -18,13 +18,14 @@ from .llm import LLM
 URL = "http://127.0.0.1:11434"
 MODEL = "qwen3.8-27b-q3:latest"
 PROMPT = """You are the agent of a FlexGrid coordinator. Homes and buildings have sent offers, and the coordinator sells them as one pool to the
-buyers' fixed orders. The code will ask the nodes for more than it sells: that extra is the margin, and it covers nodes that deliver less than they
-offered. Choose a margin from 0.05 to 0.30. The default is 0.10.
-A bigger margin can sell less, but keeps the promise on an uncertain day. A smaller one risks a shortfall, which costs reputation and future income.
-Read sell_by_margin first: for each margin it gives what would be sold, what that earns, and what the nodes would be asked for. If a bigger margin
-sells the same, it's a safer promise at no cost.
-community_forecast gives the homes' demand in the sale hours with its range: a wide range is a less certain day. Firm power is surer than tentative.
-Use only these facts. One or two plain sentences, with the numbers that mattered."""
+buyers' fixed orders. The order fills from the offers, and what is sold doesn't depend on the margin. The code also asks the nodes for more than it
+sells: that extra is the margin, the reserve for nodes that deliver less than they offered. The buyers pay for what the meters show, so a reserve that
+is delivered is paid too. Choose a margin from 0.05 to 0.30. The default is 0.10. A bigger margin asks more of the nodes and leaves them less room for a
+call or a gap. A smaller one leaves less behind the order if nodes deliver short, and what the meters don't show isn't paid. Read sell_by_margin first:
+for each margin it gives what would be sold, the most that can bring in (every kWh at the order's price, and each class's kWh is billed at its own rate, so a bill comes in
+under it unless all of it is batteries), and what the nodes would be asked for. community_forecast gives the homes' demand in the
+sale hours with its range: a wide range is a less certain day. Firm power is surer than tentative. Use only these facts. One or two plain sentences,
+with the numbers that mattered."""
 
 
 def margin_sheet(facts: dict[str, Any]) -> dict[str, Any]:
@@ -39,6 +40,11 @@ def margin_sheet(facts: dict[str, Any]) -> dict[str, Any]:
 class CoordinatorAgent(CoordinatorBrain):
     def decide_margin(self, snap: dict[str, Any]) -> dict[str, Any]:
         return super().decide_margin(margin_sheet(snap))
+
+
+def for_market(backend: Any, pooled: bool, **kw: Any) -> CoordinatorBrain:
+    """The live coordinator's agent: the same prompt and the same short sheet as make_agent's. The market that sells one pool to fixed orders is the only one this prompt describes."""
+    return CoordinatorAgent(backend, prompt=PROMPT, **kw) if pooled else CoordinatorBrain(backend, **kw)
 
 
 def make_agent(url: str = URL, model: str = MODEL, log: Callable[..., None] | None = None, budget_s: float = 60.0) -> CoordinatorAgent:

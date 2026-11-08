@@ -12,11 +12,16 @@ from pathlib import Path
 from typing import Any
 
 HERE = Path(__file__).parent
-PROMPT_VERSION = "2026-11-05"
+PROMPT_VERSION = "2026-11-07"
 SYSTEM = ("You are the energy agent for one node. You sell power cuts to the grid. Each step tells you the situation and gives "
           "you tools. First read each tool's Not when line. If a Not when line fits the situation, or nothing needs doing, call "
           "no_action. Otherwise call the one tool that fits, with the values the situation supports. Use only what the situation "
           "tells you.")
+PLAN_SYSTEM = ("You are the energy agent for one node in a power sale, and something just changed. You see the whole situation: what is owed, what runs, what can "
+               "open, what each is worth and what it costs. Decide the whole plan in one call to set_plan, by letter. Code sizes every number and holds every limit, so you "
+               "weigh money against what people feel and nothing else. Keeping every running call is the normal answer. Leaving kW uncovered, or ending a call, needs a fact from the "
+               "list, named in because: anything else is ignored. You may end one call in a plan, the one that fact is about. If you need a reading or a test first, call that tool, then "
+               "decide. Use only what the situation tells you.")
 TYPES = {"string": "string", "number": "number", "enum": "string", "time": "string"}
 
 

@@ -17,7 +17,6 @@ import sqlite3
 import threading
 import time
 import traceback
-import uuid
 from collections import deque
 from typing import Any
 
@@ -25,7 +24,7 @@ import httpx
 import uvicorn
 from fastapi import Body, FastAPI, HTTPException
 
-from . import beckn, config, envelope as envlib, forecast as fc, signing, telemetry as tcheck
+from . import beckn, config, doors, envelope as envlib, forecast as fc, ids, signing, telemetry as tcheck
 from .adapters import make_adapter
 from .home_v2 import HomeV2
 from . import replay as replay_mod
@@ -97,6 +96,8 @@ class Agent:
             return {"held_offline": True}
         t0 = time.time()
         out = self.town.send(to, kind, body, message_id)
+        if isinstance(out, dict) and out.get("duplicate"):    # Town refused it: see town.send
+            self.event("send_dropped", to=to, message_kind=kind, message_id=message_id)
         self.town_send_ms.append((time.time() - t0) * 1000)
         log.info("town_out %s to %s %.0f ms", kind, to, (time.time() - t0) * 1000)
         return out
@@ -154,7 +155,7 @@ class Agent:
             self.last_envelope = signed
         sent = None
         if self.town and self.cfg.get("v1_town_reports", False):   # v2 runs events: the v1 report every minute only
-            mid = f"{self.cfg['agent_name']}:env:{signed['seq']}:{uuid.uuid4().hex[:8]}"   # filled the coordinator's inbox
+            mid = ids.sealed(self.key, self.v2.play, self.cfg["agent_name"], self.cfg["coordinator_name"], "flex.report", signed["seq"], signed.get("slot_start"))   # filled the coordinator's inbox
             try:
                 sent = self.town.send(self.cfg["coordinator_name"], "flex.report", signed, mid)
             except Exception as exc:                                 # Town down: keep running locally
@@ -373,11 +374,11 @@ class Agent:
                 self.town_in.append((msg["kind"][6:], late))
                 log.info("town_in %s from %s %.2f s after it was sent", msg["kind"], msg.get("from"), late)
             try:
-                note, status = self.h_v2(msg), "processed"
+                note = self.h_v2(msg)
             except Exception as exc:
-                note, status = f"error: {exc}", "rejected"
+                note = beckn.Refused(f"error: {exc}")
                 log.error("v2: %s", traceback.format_exc())
-            self.town.ack(msg["message_id"], msg["fence"], status, {"note": str(note)[:200]})
+            self.town.ack(msg["message_id"], msg["fence"], *beckn.ack_of(note))
         else:
             self.town.ack(msg["message_id"], msg["fence"], "rejected", {"reason": "unknown_kind"})
 
@@ -397,7 +398,7 @@ def retention_loop(cfg: dict[str, Any], event) -> None:
 
 
 def build_app(agent: Agent) -> FastAPI:
-    app = FastAPI(title="flexgridd", version="0.1.0")
+    app = FastAPI(title="flexgridd", version="0.1.0", dependencies=[doors.door()])
 
     @app.get("/health")
     def health():

@@ -278,7 +278,8 @@ class QueuedBrain:
     def __init__(self, queue: BrainQueue, node: str, kind: str = "sale", model: str | None = None, options: dict[str, Any] | None = None):
         if model is None or options is None:
             from .agent import MODEL, OPTIONS          # here, not above, so agent.py can import this file
-            model, options = model or MODEL, options or OPTIONS
+            from .arm import model_options
+            model, options = model or MODEL, options or model_options(OPTIONS)
         self.queue, self.node, self.kind, self.model, self.options = queue, node, kind, model, options
         self.agent: Any = None
         self.calls = 0

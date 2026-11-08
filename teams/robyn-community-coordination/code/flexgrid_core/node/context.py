@@ -4,13 +4,16 @@
   Predict  forecast_site, estimate_sellable
   Think    simulate_plan, lookup_device_card
   Trade    read_request, submit_offer, answer_commitment, report_shortfall
-  Act      the node's own device tools, read_device and no_action
+  Act      the node's own device tools, read_device and no_action, and for an exception set_plan and release_call
 
 Code runs the workflow and enters a step. Each step shows only its own one to three tools, and a step that can act shows the device
 shortlist too. Once a tool has answered, the step hides it: on the real model, simulate_plan on the sale step took all six turns of a
 step and no device was opened. So the sale step shows the shortlist alone, the list that was tested. Every call goes: the step's
 menu, the arguments, policy, then the tool. A device call goes on to the guard, the seal and the driver. The model reads only `view`,
 a short line, and code does all the arithmetic.
+
+An exception is one decision over the whole node (NodeAgent.plan): plan_tools() shows set_plan, whose letters stand for what can open and
+what runs, with the reading tools this exception makes worth having. A simulation always says it is one, and a release goes through the same door as a call.
 
 The server serves homes and buildings alike. It needs what NodeAgent already has: name, shelf, guard, view(), menu(), apply(),
 close(), and for the market side HomeV2, which serves both. agent_mcp.serve_context() puts it on MCP's stdio transport.
@@ -30,6 +33,7 @@ from typing import Any, Callable
 
 import numpy as np
 
+from .. import rt_control
 from . import drivers as D
 from . import owner
 from . import policy as P
@@ -67,7 +71,7 @@ CONTEXT: dict[str, dict[str, Any]] = {
                           "description": "Works out firm and tentative kW for the window, by device. Use when deciding how much to offer. Not after the offer has gone."},
     "simulate_plan": {"job": ("read", P.SITE), "example": 'simulate_plan(calls=[{"tool": "set_battery", "target": "home-battery", "action": "discharge", "kw": 3}])',
                       "parameters": [_param("calls", "calls", "the device calls to test, up to 4")],
-                      "description": "Tests device calls without sending anything, and gives the kW and what is left owed. Use when unsure a choice covers a shortfall. Not to act: nothing moves."},
+                      "description": "A test: says what device calls would give and leave owed. Nothing is sent, and no device moves. Use when unsure a choice covers a shortfall. Not to act: its answer is never a call that ran."},
     "lookup_device_card": {"job": ("read", P.SITE), "example": 'lookup_device_card(tool="set_battery")', "parameters": [_param("tool", "enum", "the tool to read about", "this node's tools")],
                            "description": "Reads one tool's card: what it does, how fast, what follows, its limits. Use when a device's limits are unclear. Not for its reading now: read_device gives that."},
     "read_request": {"job": ("read", P.MARKET), "example": "read_request()", "parameters": [],
@@ -78,9 +82,17 @@ CONTEXT: dict[str, dict[str, Any]] = {
     "answer_commitment": {"job": ("trade", P.MARKET), "example": 'answer_commitment(decision="accept", reason="fits the plan")',
                           "parameters": [_param("decision", "enum", "accept or decline", "accept | decline"), REASON],
                           "description": "Answers a commitment that code has checked. Use when one is waiting. Not to change its kW. Code can't be overruled: a no stays a no."},
-    "report_shortfall": {"job": ("trade", P.MARKET), "example": 'report_shortfall(reason="device_out")',
-                         "parameters": [_param("reason", "enum", "what caused it", "device_out | schedule_changed | owner_need | forecast_changed | other")],
+    "report_shortfall": {"job": ("trade", P.MARKET), "example": 'report_shortfall(reason="forecast_changed")',
+                         "parameters": [_param("reason", "enum", "what caused it. device_out only for a device that reads out, owner_need only for a wish or a person's word", "device_out | schedule_changed | owner_need | forecast_changed | other")],
                          "description": "Tells the coordinator this node will fall short, and code fills the kW. Use when no device can cover the gap. Not when a device can still cover it."},
+    "release_call": {"job": ("trade", P.MARKET), "example": 'release_call(target="floor-12-lights", reason="people came in")',
+                     "parameters": [_param("target", "string", "the device a running call holds"), REASON],
+                     "description": "Lets one running call go: the device goes back to its own day and its kW stop counting. Use when it presses on something that changed. Not to change its size."},
+    "set_plan": {"job": ("trade", P.MARKET), "example": 'set_plan(open=["A", "C"], end_call="none", report="none", because="none", reason="covers it with no one feeling it")',
+                 "parameters": [_param("open", "ids", "letters of what to open now"), _param("end_call", "ids", "the one running call to end, giving up its kW, or none"),
+                                _param("report", "enum", "tell the desk why kW stay uncovered, or none", "none | device_out | schedule_changed | owner_need | forecast_changed | other"),
+                                _param("because", "string", "the fact behind leaving kW uncovered or letting a call go: its id, or none"), REASON],
+                 "description": "The whole plan for this exception, in one call: what opens, what is let go, what the desk hears. Use when you have decided. Not for a test: simulate_plan is the test."},
 }
 STEPS: dict[str, tuple[str, ...]] = {
     "1 read schedule": ("get_free_windows",),
@@ -94,9 +106,16 @@ STEPS: dict[str, tuple[str, ...]] = {
     "8 exception": ("get_site_status", "simulate_plan", "report_shortfall"),
     "9 report": ("get_site_status",),
 }
+PLAN_READS = ("simulate_plan", "get_free_windows", "forecast_site", "estimate_sellable", "lookup_device_card")     # shown in an exception only when it makes them worth having: NodeAgent.plan_reads
+PLAN_TOOLS = ("set_plan", "release_call")       # an exception's own, through plan_tools: FG_WALK=model keeps the step's old list
 ACT_STEPS = ("6 prepare", "7 watch", "8 exception")
 ONCE_PER_REQUEST = ("submit_offer", "answer_commitment")
 SENT = ("done", "adjusted")
+TEST_LABEL = "A test only: nothing has opened yet."      # a simulation's answer goes into the next prompt: on the real model "X: done, 8.64 kW" read as a call that had run,
+# and on 7 Nov "TEST ONLY, nothing was sent" read as the answer itself: plans copied it as their reason and opened nothing
+WOULD = {"done": "would be taken", "adjusted": "would be lowered", "blocked": "would be blocked", "failed": "would fail"}
+# What the model may say about a shortfall, as the desk reads it. These words are in rt_market.KNOWN_REASONS: anything else reaches the pool as "not given"
+SHORT_WORDS = {"device_out": "a device is out", "schedule_changed": "the schedule changed", "owner_need": "an owner's need came first", "forecast_changed": "the forecast changed", "other": "another cause"}
 HELD_BY_CONTROLLER = {"set_water_heater": ("hpwh",), "set_pool_pump": ("pool",), "delay_appliance": ("dish", "dryer")}     # devices a home's controller holds by itself
 
 
@@ -107,6 +126,9 @@ def spec(name: str, shelf: list[str] | None = None) -> dict[str, Any]:
     for p in c["parameters"]:
         if p["type"] == "calls":
             props[p["name"]] = {"type": "array", "items": {"type": "object"}, "description": p["says"]}
+            continue
+        if p["type"] == "ids":
+            props[p["name"]] = {"type": "array", "items": {"type": "string"}, "description": p["says"]}
             continue
         d: dict[str, Any] = {"type": "number" if p["type"] == "number" else "string", "description": p["says"]}
         if p["type"] == "enum":
@@ -156,6 +178,11 @@ def clean_args(params: list[dict[str, Any]], args: Any) -> tuple[dict[str, Any],
             if not isinstance(v, list) or not 1 <= len(v) <= MAX_SIMULATE or not all(isinstance(c, dict) for c in v):
                 return {}, f"{k} must list 1 to {MAX_SIMULATE} device calls."
             out[k] = v
+        elif kind == "ids":
+            ids = [v] if isinstance(v, str) else v
+            if not isinstance(ids, list) or len(ids) > 16 or not all(isinstance(c, str) and re.fullmatch(r"[A-Z][0-9]{0,2}|none", c) for c in ids):
+                return {}, f"{k} must list ids like A or R1."
+            out[k] = ids
         else:
             if not isinstance(v, str) or len(v) > (64 if k == "target" else TEXT_MAX) or any(ord(c) < 32 for c in v):
                 return {}, f"{k} must be plain text, {64 if k == 'target' else TEXT_MAX} characters at most."
@@ -201,6 +228,11 @@ def run_call(tool: str, args: Any, start: str, end: str, f: dict[str, Any], side
     out["answer"] = gate.run({"tool": tool, "args": clean, "start": start, "end": end}, f)
     out["command"], out["driver"] = gate.last.get("command"), gate.last.get("driver")
     return out
+
+
+def listed(tools: list[dict[str, Any]]) -> dict[str, list[str] | None]:
+    """What a turn's tools allow: each tool and the targets it lists, or None for a tool with no target list."""
+    return {t["function"]["name"]: (t["function"]["parameters"]["properties"].get("target") or {}).get("enum") for t in tools}
 
 
 def guard_state(guard: Any) -> dict[str, Any]:
@@ -324,6 +356,13 @@ class Desk:
     """The node's market side, for homes and buildings alike: HomeV2 serves both. A message with no transaction is held for the
     caller: HomeV2.handle sends what brain.decide_offer and decide_accept return."""
 
+    def report(self, labelled: dict[str, Any]) -> dict[str, Any]:
+        """Step 9's labelled answer goes up to the coordinator, signed. It keeps it beside the sale, and no model reads it there."""
+        from .. import beckn
+        v2 = self.v2
+        body = beckn.make("on_status", sender=v2.name, receiver=v2.coordinator, transaction_id=f"report-{v2.name}", message={"node_report": labelled}, key=v2.key, sender_role="bpp")
+        return {"sent": v2.send(v2.coordinator, beckn.kind("on_status"), body, v2.mid(v2.coordinator, "on_status", "report", labelled.get("sale"), labelled.get("ts")))}
+
     def __init__(self, v2: Any):
         self.v2 = v2
 
@@ -361,11 +400,11 @@ class Desk:
         return self.v2.answer(request["txn"], request["contract"], verdict)
 
     def shortfall(self, short: dict[str, float], reason: str) -> dict[str, Any]:
-        from .. import beckn
+        from .. import beckn, ids
         v2 = self.v2
-        body = beckn.make("rt_capacity", sender=v2.name, receiver=v2.coordinator, transaction_id=f"cap-{v2.name}", message={"short": short, "reason": reason},
-                          key=v2.key, sender_role="bpp")
-        return {"sent": v2.send(v2.coordinator, beckn.kind("rt_capacity"), body, f"{v2.name}:rt_capacity:{R.sha(short, reason)[:6]}")}
+        msg = {"short": short, "reason": reason}
+        body = beckn.make("rt_capacity", sender=v2.name, receiver=v2.coordinator, transaction_id=f"cap-{v2.name}", message=msg, key=v2.key, sender_role="bpp")
+        return {"sent": v2.send(v2.coordinator, beckn.kind("rt_capacity"), body, v2.mid(v2.coordinator, "rt_capacity", v2.now_ts(), ids.digest(msg)))}
 
 
 def offer_request(need: dict[str, Any], safe: dict[str, Any], txn: str | None = None) -> dict[str, Any]:
@@ -414,12 +453,14 @@ class ContextServer:
         self.step: str | None = None
         self.ts = ""
         self.seen: set[str] = set()               # tools that have answered in this step
+        self.reads: set[str] = set()              # readings this exception made worth having
         self.sale: dict[str, Any] | None = None
         self.request: dict[str, Any] | None = None
         self.chosen: dict[str, Any] = {}          # what was decided, by request id, for a caller holding the message
         self.stopped: str | None = None           # an alarm's stop: nothing is sent until a person clears it, whatever the signal does
         self.acted: set[str] = set()              # calls this process has already answered, so a repeat isn't counted twice
         self.handed_back = False                  # the model went, so the controller is running this sale alone
+        self.shown: dict[str, list[str] | None] | None = None     # what this step last offered the model: the guard refuses a device call outside it
         self._restore()
 
     def _restore(self) -> None:
@@ -428,16 +469,24 @@ class ContextServer:
 
         The guard's other memory stays behind on purpose: a restart resets the levers too, so a point it remembered would only block the node's own new call."""
         stop, wishes = None, []
+        self.notes_read: set[str] = set()         # the notes on file this node has read: a date in one means what it meant the first time
+        self.noted: str | None = None             # the last door note it read, so a restart doesn't read it twice
         for r in list(self.log.rows):
             k = r["kind"]
             if k == "new_run":
                 self.request, stop, wishes = None, None, []
+                self.notes_read.clear()
+                self.noted = None
             elif k == "alarm":
                 stop = r.get("why") or "alarm"
             elif k == "request":
                 self.request = r.get("request")
-            elif k == "decision" and r.get("why") == "owner's note":
+            elif k == "decision" and r.get("why") == "owner's note" and r.get("node", self.node.name) == self.node.name:     # a loan's row is on the lender's log, and it's the borrower's wish
                 wishes += [w for w in r.get("answer") or [] if isinstance(w, dict) and w.get("wish") in owner.BLOCKS]
+                self.notes_read.add(str(r.get("text")))
+                self.noted = r.get("note_key") or self.noted
+            elif k == "wish_ended":
+                wishes = [w for w in wishes if (w.get("wish"), w.get("from", "")) != (r.get("wish"), r.get("since"))]
             elif k == "owner_channel" and (r.get("result") or {}).get("status") == "done":
                 if r["verb"] in ("close_group", "need_now"):
                     self.policy.closed[r["group"]] = r["role"]
@@ -455,6 +504,7 @@ class ContextServer:
         if stop:
             self.stopped = stop
             self.gate.release_all()
+            self._controller("hold", stop)
 
     # ------------------------------------------------------------------ the workflow
     def enter(self, step: str, ts: str, sale: dict[str, Any] | None = None, request: dict[str, Any] | None = None) -> None:
@@ -463,8 +513,9 @@ class ContextServer:
             raise ValueError(f"no step {step!r}")
         self.leave()
         self.step, self.ts, self.sale = step, ts, sale
-        self.seen = set()
+        self.seen, self.shown = set(), None
         self.handed_back = self.handed_back and step != "7 watch"      # a new sale opens its own levers
+        self.reads = set()
         if request is not None:
             self.request = request
         self.steps.enter(step, ts, sale=(sale or {}).get("start"), request=(self.request or {}).get("id"))
@@ -474,15 +525,23 @@ class ContextServer:
             self.steps.leave(self.step, self.ts, outcome)
         self.step = None
 
-    def new_run(self) -> None:
-        """A run over the same days again on the same log, as fleet.py's demo does. Without this a repeat would answer done and send nothing."""
+    def new_run(self, keep_alarm: bool = False) -> None:
+        """A run over the same days again on the same log, as fleet.py's demo does. Without this a repeat would answer done and send nothing.
+        keep_alarm: fleet.py's door has no signature, so an alarm stays on through it, and on the record for a restart."""
+        held = self.stopped if keep_alarm else None
         self.leave("new run")
         self.steps.new_run()
-        if self.stopped:
+        if self.stopped and not held:
             self._controller("clear_stop")        # the restore's stop was the last run's
-        self.seen, self.chosen, self.request, self.acted, self.stopped = set(), {}, None, set(), None
+        self.seen, self.chosen, self.request, self.acted, self.stopped = set(), {}, None, set(), held
+        if held:
+            self.log.add("alarm", ts=self.ts, why=held, release={"status": "kept through a reset"})
         self.node.guard.wishes = []
         self.node.guard.clear()
+        self.notes_read.clear()
+        self.noted = None
+        if hasattr(self.node, "noted"):
+            self.node.noted = None
 
     def facts(self) -> dict[str, Any]:
         """What the node reads now. With no sale running, the window ahead stands in, with nothing owed."""
@@ -495,6 +554,38 @@ class ContextServer:
         """A stop after an alarm reads as the alarm, so the guard's first step answers it and a replay sees the same."""
         return {**f, "alarm": f.get("alarm") or self.stopped} if self.stopped else f
 
+    def plan_tools(self, st: dict[str, Any], reads: list[str]) -> list[dict[str, Any]]:
+        """What the model sees in an exception: set_plan, with the letters of this moment as the only values it can send, then the readings that matter here, then no_action.
+        With nothing to open or let go it can only say why kW stay uncovered."""
+        self.reads = {t for t in reads if t in PLAN_READS}
+        out: list[dict[str, Any]] = []
+        if st["options"] or st["running"]:
+            s = spec("set_plan")
+            props = s["function"]["parameters"]["properties"]
+            if st["options"]:
+                props["open"]["items"]["enum"] = [x["id"] for x in st["options"]]
+            else:
+                del props["open"]                 # with nothing there a letter could only be made up
+            if st["running"]:
+                props["end_call"] = {"type": "string", "description": "the one running call to end, giving up its kW, or none. Ending a call never covers anything", "enum": ["none"] + [x["id"] for x in st["running"]]}
+            else:
+                del props["end_call"]
+            props["because"]["enum"] = ["none"] + [x["id"] for x in st["facts"]]
+            s["function"]["parameters"]["required"] = list(props)
+            out.append(s)
+        else:
+            out.append(spec("report_shortfall"))
+        for t in reads:
+            if t in self.reads and t not in self.seen:
+                s = spec(t, self.node.shelf)
+                if t == "simulate_plan":
+                    s["function"]["parameters"] = {"type": "object", "required": ["open"], "properties": {"open": {"type": "array", "description": "the letters to test", "items": {"type": "string", "enum": [o["id"] for o in st["options"]]}}}}
+                    s["function"]["description"] = CONTEXT[t]["description"] + ' Example: simulate_plan(open=["A", "C"])'
+                if t in ("get_free_windows", "forecast_site"):
+                    s["function"]["parameters"]["properties"]["day"]["enum"] = ["today"]
+                out.append(s)
+        return out + [T.spec(self.side, "no_action")]
+
     def tools(self) -> list[dict[str, Any]]:
         """This step's own tools, less those that have already answered. A step that can act adds the device shortlist through menu()."""
         return [spec(t, self.node.shelf) for t in STEPS.get(self.step or "", ()) if t not in self.seen]
@@ -502,7 +593,21 @@ class ContextServer:
     def menu(self, f: dict[str, Any], used: set[str], reads: bool = True) -> list[dict[str, Any]]:
         """What the model sees this turn: the node's shortlist, at most 8 device tools and read_device and no_action, then the step's own."""
         shown = self.node.menu(f, used, reads) if self.step in ACT_STEPS else []
-        return [t for t in shown if P.group_of(t["function"]["name"]) not in self.policy.closed] + self.tools()      # SPEC section 5: nothing blocked
+        out = [t for t in shown if P.group_of(t["function"]["name"]) not in self.policy.closed] + self.tools()      # SPEC section 5: nothing blocked
+        for t in out:                                                     # the card says what a person lowered, not only the step's words
+            fn = t["function"]
+            if fn["name"] in (f.get("lowered") or {}):
+                fn["description"] += f' Now: {f["lowered"][fn["name"]]}'
+        self.shown = listed(out)
+        return out
+
+    def show(self, tools: list[dict[str, Any]]) -> None:
+        """A step that builds its own list says so here. The morning's pre-cool does."""
+        self.shown = listed(tools)
+
+    def on_list(self, f: dict[str, Any]) -> dict[str, list[str] | None]:
+        """What a device call may name now: what the model was offered, or with nothing offered yet, as with an MCP client that hasn't listed, what this step would offer."""
+        return self.shown if self.shown is not None else listed(self.node.menu(f, set(), True))
 
     # ------------------------------------------------------------------ calling a tool
     def act(self, tool: str, args: Any, *, start: str, end: str, facts: dict[str, Any] | None = None, who: P.Who = P.AGENT) -> dict[str, Any]:
@@ -510,6 +615,8 @@ class ContextServer:
         per point would say, so the agent doesn't count its kW twice. After a restart the first answer comes back: that memory is gone, and the call is running."""
         f = self._held(facts) if facts is not None else self.facts() if self.step in ACT_STEPS else {}
         target = str(args.get("target", ""))[:64] if isinstance(args, dict) else ""
+        if self.step in ACT_STEPS:
+            f = {**f, "menu": self.on_list(f)}
 
         def first() -> dict[str, Any]:
             before = guard_state(self.node.guard)
@@ -541,7 +648,7 @@ class ContextServer:
                 return self._no(f"{name} isn't on this step's list.", name, args, who)
             return self._device(name, args, who)
         c = CONTEXT.get(name) if isinstance(name, str) else None
-        if c is None or name not in STEPS.get(self.step or "", ()):
+        if c is None or (name not in STEPS.get(self.step or "", ()) and name not in self.reads and not (name in PLAN_TOOLS and self.step == "8 exception")):
             return self._no(f"{str(name)[:40]} isn't on this step's list.", name, args, who)
         if name in self.seen and c["job"][0] == "read":      # a trade tool gives its first answer again, further down
             return self._no(f"{name} has answered in this step. Use what it said.", name, args, who)
@@ -605,7 +712,10 @@ class ContextServer:
     # ------------------------------------------------------------------ see
     def _groups(self, f: dict[str, Any]) -> dict[str, dict[str, Any]]:
         out: dict[str, dict[str, Any]] = {}
+        kept = self._kept()                       # a wish or a closed group gives nothing, so it isn't counted
         for d in f["devices"].values():
+            if d["tool"] in kept:
+                continue
             g = out.setdefault(P.group_of(d["tool"]) or "other", {"kw": 0.0, "targets": [], "tools": []})
             g["kw"] += float(d.get("can_give_kw", 0.0))
             g["targets"].append(d["target"])
@@ -627,6 +737,7 @@ class ContextServer:
             words.append(f'Sale window {f["sale"]["start"][11:16]} to {f["sale"]["end"][11:16]}.')
         words.append(f"{owed:.1f} kW are owed.")
         words += [f'{GROUP_TITLE.get(k, k)} can give {v["kw"]:.2f} kW.' for k, v in sorted(groups.items(), key=lambda x: -x[1]["kw"])]
+        words += list((f.get("lowered") or {}).values())
         words.append("No alarms." if not f.get("alarm") else f'Alarm: {f["alarm"]}.')
         return {"status": "done", "view": " ".join(words), "owed_kw": round(owed, 2), "groups": {k: round(v["kw"], 2) for k, v in groups.items()}, "alarm": f.get("alarm")}
 
@@ -691,12 +802,13 @@ class ContextServer:
         if own is not None:
             return own(start, end)
         v2 = self.v2
+        kept = self._kept()                                # a wish or a closed group sells nothing
         if v2 is not None and v2.cfg.get("forecast") == "trained_2026" and not v2.is_building:
             try:
-                return {"source": "forecasts", **sellable.home_window(self.node.sim, v2._models(), start, end, v2.now_idx(), self.node.shelf)}
+                return {"source": "forecasts", **sellable.home_window(self.node.sim, v2._models(), start, end, v2.now_idx(), [t for t in self.node.shelf if t not in kept])}
             except ValueError:                             # that day isn't forecast yet
                 pass
-        total = sum(float(d.get("can_give_kw", 0.0)) for d in self.facts()["devices"].values())
+        total = sum(float(d.get("can_give_kw", 0.0)) for d in self.facts()["devices"].values() if d["tool"] not in kept)
         firm = round(total * sellable.FALLBACK_SHARE, 3)
         return {"source": "devices now", "expected_kw": round(total, 3), "firm_kw": firm, "tentative_kw": round(total - firm, 3), "devices": {}}
 
@@ -704,33 +816,83 @@ class ContextServer:
     def _simulate_plan(self, calls: list[dict[str, Any]]) -> dict[str, Any]:
         """A copy of the guard answers, so no point is taken and nothing is sent."""
         f = self.facts()
+        if self.step in ACT_STEPS:                # a test says what the real call would say
+            f = {**f, "menu": self.on_list(f)}
         g = copy.copy(self.node.guard)
         for k, v in vars(g).items():
             if isinstance(v, (dict, list, set)) and k != "setup":
                 setattr(g, k, copy.deepcopy(v))
         start, end = (max(self.ts, self.sale["start"]), self.sale["end"]) if self.sale else self._window()
         rows, kw = [], 0.0
+        node, seen = self.node, set()
+        pre_of = getattr(node, "prerequisite", None)
+        after = getattr(node, "after_test", lambda f, d, a: f)
+
+        def one(tool: str, args: dict[str, Any], f: dict[str, Any], who: P.Who) -> tuple[dict[str, Any], dict[str, Any]]:
+            clean, why = clean_args(device_params(self.side, tool), args)
+            v = self.policy.check(who, "call", P.group_of(tool))             # a test says what the real call would say
+            why = why or ("" if v["allow"] else v["why"])
+            return clean, blocked(str(args.get("target", ""))[:64], why) if why else g.check({"tool": tool, "args": clean, "start": start, "end": end}, f)
+
         for c in calls:
             tool = c.get("tool")
             args = {k: v for k, v in c.items() if k != "tool"}
             if tool not in f["shelf"]:
                 rows.append({"tool": str(tool)[:40], "status": "blocked", "kw": 0.0, "why": "This node has no such tool."})
                 continue
-            clean, why = clean_args(device_params(self.side, tool), args)
-            v = self.policy.check(P.AGENT, "call", P.group_of(tool))         # a test says what the real call would say
-            why = why or ("" if v["allow"] else v["why"])
-            a = blocked(str(args.get("target", ""))[:64], why) if why else g.check({"tool": tool, "args": clean, "start": start, "end": end}, f)
+            d = next((x for x in f["devices"].values() if x["tool"] == tool and x["target"] == args.get("target")), None)
+            if d is not None and f'{tool}:{d["target"]}' in seen:
+                rows.append({"tool": tool, "target": d["target"], "status": "done", "kw": 0.0, "why": "Set already, as what an earlier call waited for."})
+                continue                            # as a plan carries it out: no second write
+            pre = pre_of(d, f) if pre_of and d is not None else None
+            if pre is not None and f'{pre["tool"]}:{pre["target"]}' not in seen:      # what it waits for goes first, as a plan carries it out (first_needs): code's own call, on its own list
+                pa, ap = one(pre["tool"], node.ready(pre, f, self._owed(f)), {k: x for k, x in f.items() if k != "menu"}, P.CODE)
+                rows.append({"tool": pre["tool"], "target": ap["target"], "status": ap["status"], "kw": ap["expected_kw"], "why": " ".join(x for x in (f'Set first: {d["target"]} waits for it.', ap["why"]) if x)})
+                if ap["status"] in SENT:
+                    kw += ap["expected_kw"]
+                    f = after(f, pre, {**pa, **(ap.get("applied") or {})})
+                    seen.add(f'{pre["tool"]}:{pre["target"]}')
+            clean, a = one(tool, args, f, P.AGENT)
             rows.append({"tool": tool, "target": a["target"], "status": a["status"], "kw": a["expected_kw"], "why": a["why"]})
-            if a["status"] in ("done", "adjusted"):
+            if a["status"] in SENT:
                 kw += a["expected_kw"]
-        left = max(0.0, self._owed(f) - kw)
-        view = " ".join(f'{r.get("target") or r["tool"]}: {r["status"]}, {r["kw"]:.2f} kW.' + (f' {r["why"]}' if r["why"] else "") for r in rows) + f" That leaves {left:.2f} kW owed."
-        return {"status": "done", "view": view, "plan": rows, "total_kw": round(kw, 2), "left_kw": round(left, 2)}
+                if d is not None:
+                    f = after(f, d, {**clean, **(a.get("applied") or {})})          # zones eased here ease the fans for the calls after
+                    seen.add(f'{tool}:{d["target"]}')
+        for r in getattr(node, "test_unlocked", lambda f, seen: [])(f, seen):     # what code opens after the calls, which the letters already count
+            rows.append(r)
+            kw += r["kw"]
+        owed = self._owed(f)
+        left = max(0.0, owed - kw)
+        view = (f"{TEST_LABEL} " + " ".join(f'{r.get("target") or r["tool"]}: {WOULD.get(r["status"], r["status"])}, {r["kw"]:.2f} kW.' + (f' {r["why"]}' if r["why"] else "") for r in rows)
+                + f" If these ran, {left:.2f} kW would still be owed. Right now {owed:.2f} kW are owed. Nothing opens until you call set_plan.")
+        return {"status": "done", "simulated": True, "view": view, "plan": rows, "total_kw": round(kw, 2), "left_kw": round(left, 2), "owed_kw": round(owed, 2)}
+
+    def _test_guard(self) -> Any:
+        g = copy.copy(self.node.guard)
+        for k, v in vars(g).items():
+            if isinstance(v, (dict, list, set)) and k != "setup":
+                setattr(g, k, copy.deepcopy(v))
+        return g
+
+    def dry(self, tool: str, args: dict[str, Any], start: str, end: str, f: dict[str, Any]) -> dict[str, Any]:
+        """What the real call would hear now, with no point taken and nothing sent: a plan offers only what would go through, and says why the rest can't."""
+        target = str(args.get("target", ""))[:64]
+        clean, why = clean_args(device_params(self.side, tool), args)
+        v = self.policy.check(P.AGENT, "call", P.group_of(tool))
+        why = why or ("" if v["allow"] else v["why"])
+        if why:
+            return blocked(target, why)
+        try:
+            return self._test_guard().check({"tool": tool, "args": clean, "start": start, "end": end}, f)
+        except Exception as exc:                  # a guard that breaks has said no
+            return blocked(target, f"The guard couldn't check this ({type(exc).__name__}).")
 
     def _lookup_device_card(self, tool: str) -> dict[str, Any]:
         if tool not in self.node.shelf:
             return {"status": "blocked", "why": "This node has no such tool.", "view": "This node has no such tool."}
-        return {"status": "done", "view": card_view(self.side, tool)}
+        now = (self.facts().get("lowered") or {}).get(tool)
+        return {"status": "done", "view": card_view(self.side, tool) + (f" Now: {now}" if now else "")}
 
     # ------------------------------------------------------------------ trade
     def _read_request(self) -> dict[str, Any]:
@@ -740,7 +902,7 @@ class ContextServer:
         w = r.get("window") or ("", "")
         if r["kind"] == "offer":
             safe = [s.get("kw_offered", 0.0) for s in (r.get("safe") or {}).get("slots", [])]
-            view = f'The buyer asks for {str(w[0])[11:16]} to {str(w[1])[11:16]} on {str(w[0])[:10]} at ${r["price"]:.2f} per kWh. The safe offer is {max(safe, default=0.0):.2f} kW.'
+            view = f'The buyer asks for {str(w[0])[11:16]} to {str(w[1])[11:16]} on {str(w[0])[:10]} at up to ${r["price"]:.2f} per kWh. The safe offer is {max(safe, default=0.0):.2f} kW.'
         else:
             view = f'A commitment of {max([float(k) for k in r.get("kw") or []], default=0.0):.2f} kW for {str(w[0])[11:16]} to {str(w[1])[11:16]}. Code says {r["verdict"]["decision"]}.'
         return {"status": "done", "view": view, "kind": r["kind"], "id": r.get("id")}
@@ -772,12 +934,59 @@ class ContextServer:
         return {"status": "done", "view": f'Answered {v["decision"]}.', "decision": v["decision"], "sent": sent}
 
     def _report_shortfall(self, reason: str) -> dict[str, Any]:
-        """Code fills the kW from the controller's last plan, or from what is owed and not covered."""
+        """Code fills the kW from the controller's last plan, or from what is owed and not covered. The reason is a claim, and code holds what it can read:
+        device_out was true in 2 of 16 reports on the real model, because it is the card's example. A claim that fails goes up in code's own words, and the record keeps both.
+        A report with devices still closed is refused: on 9 Jul the office filed four with 105 kW unopened, and a report ended the step."""
         short = self._short()
         if not short:
             return {"status": "blocked", "why": "The plan covers what is owed.", "view": "The plan covers what is owed."}
-        once = self.steps.once(("shortfall", self.ts[:10], short, reason), lambda: {"sent": self.desk.shortfall(short, reason)})
-        return {"status": "done", "view": f"Reported {max(short.values()):.2f} kW short.", "short": short, **once}
+        can = self._still_open()
+        if can > 0.05 and can >= max(short.values()):
+            why = f"Devices still closed can give {can:.2f} kW, which covers this."
+            return {"status": "blocked", "why": why, "view": why}
+        holds, words = self._reason_holds(reason)
+        self.node.short_reason = words
+        once = self.steps.once(("shortfall", self.ts[:10], short, reason), lambda: {"sent": self.desk.shortfall(short, words)})
+        view = f"Reported {max(short.values()):.2f} kW short, because {words}." if holds else f"Reported {max(short.values()):.2f} kW short. {reason} doesn't fit what this node reads, so it went up as: {words}."
+        return {"status": "done", "view": view, "short": short, "reason": words, "claim": reason, "claim_holds": holds, **once}
+
+    def _still_open(self) -> float:
+        """kW the devices nobody has opened could still give."""
+        fn = getattr(self.node, "still_open", None)
+        return float(fn(self.facts())) if fn is not None else 0.0
+
+    def _reason_holds(self, reason: str) -> tuple[bool, str]:
+        """(does the node's own reading back this up, the words to send). What code can't read stands as said."""
+        sim = getattr(self.node, "sim", None)
+        ov = getattr(sim, "overrides", None) or {}
+        lev = getattr(sim, "levers", None) or {}
+        tripped = bool(sim is not None and getattr(sim, "E", 0) > 0 and getattr(sim, "P", 1) <= 0)
+        wishes = bool(getattr(self.node.guard, "wishes", None) or self.policy.closed or ov.get("ev_now") or ov.get("note"))
+        holds = sim is None or {"device_out": tripped, "owner_need": wishes, "schedule_changed": bool(lev.get("events") or ov.get("zone_event") or ov.get("closed"))}.get(reason, True)
+        if holds:
+            return True, SHORT_WORDS.get(reason, SHORT_WORDS["other"])
+        own = getattr(self.v2, "_rt_reason", None)
+        return False, own() if own is not None else SHORT_WORDS["other"]
+
+    def _release_call(self, target: str, reason: str) -> dict[str, Any]:
+        """A running call ends now, through the same driver a person's "need it now" uses. Its kW stop counting, so the model sees them as owed again. Ending a limit is always allowed:
+        the device goes back to its own day."""
+        calls = [c for c in getattr(self.node, "calls", []) if c["target"] == target]
+        if not calls:
+            why = f"No call of this node runs on {target}."
+            return {"status": "blocked", "why": why, "view": why}
+        kw = sum(float(c["expected_kw"]) for c in calls)
+        out = self.driver.release(target)
+        if out.get("status") != "done":
+            return {"status": "failed", "why": out.get("why", ""), "view": f"{target} couldn't be let go: {out.get('why', '')}"}
+        return {"status": "done", "view": f"{target} was let go, so {kw:.2f} kW no longer count.", "kw": round(kw, 2), "reason": reason}
+
+    def _set_plan(self, open: list[str] | None = None, end_call: list[str] | None = None, report: str = "none", because: str = "none", reason: str = "") -> dict[str, Any]:
+        """The same plan through MCP: NodeAgent.plan carries out the one the model gives in its own step."""
+        take = getattr(self.node, "take_plan", None)
+        if take is None or not self.sale:
+            return {"status": "blocked", "why": "No sale is running, so there is no plan to set.", "view": "No sale is running, so there is no plan to set."}
+        return take({"open": open or [], "end_call": end_call or [], "report": report, "because": because, "reason": reason})
 
     def _short(self) -> dict[str, float]:
         ctl = getattr(getattr(self.node, "sim", None), "ctl", None)
@@ -824,15 +1033,17 @@ class ContextServer:
                 return {"status": "blocked", "why": why}
             return self.steps.once(("message", ctx.get("messageId") or R.sha(body)), first, lambda a: a["status"] == "done")
 
-    def alarm(self, why: str) -> None:
+    def alarm(self, why: str, ts: str | None = None) -> None:
         """Life safety: nothing more is sent, and every agent limit releases. It holds when the signal ends and across a restart, until a person clears it
-        through the signed channel. A second call changes nothing."""
+        through the signed channel. The first call does that. Each step calls this again, and that only says the stop again to the controller: the guard reads
+        self.stopped and the controller reads its own overrides, and whatever takes one away, they must not come to disagree. ts: when, since the last step
+        entered can be hours back."""
         with self._lock:
-            if self.stopped:
-                return
-            self.stopped = str(why)[:80]
-            out = self.gate.release_all()
-            self.log.add("alarm", ts=self.ts, why=self.stopped, release=out)
+            if not self.stopped:
+                self.stopped = str(why)[:80]
+                out = self.gate.release_all()
+                self.log.add("alarm", ts=ts or self.ts, why=self.stopped, release=out)
+            self._controller("hold", self.stopped)
 
     def closed_tools(self) -> set[str]:
         """This node's tools in a group a person has closed."""
@@ -844,6 +1055,8 @@ class ContextServer:
         self.handed_back = True
         keep = self._kept()
         if keep and getattr(self.node, "zm", None) is not None:
+            if self.node.sim.levers is None:      # no agent opened anything here, as at a building on a loan: the controller runs it all, so the wish has to hold there
+                self.node.hold_out(keep)
             return                                # a building's levers can't open all but a few: what the agent opened stays and the rest stays closed
         self.node.close()
         if keep:
@@ -858,29 +1071,41 @@ class ContextServer:
         if isinstance(self.driver, D.SimulatedDriver):
             getattr(self, "_sim_" + what)(*args)
 
-    def owner_channel(self, keys: dict[str, str]) -> P.OwnerChannel:
-        """A person's channel. What people said is back already (_restore): this takes no old message again."""
+    def owner_channel(self, keys: dict[str, str], seq: dict[str, int] | None = None, save: Callable[[dict[str, int]], Any] | None = None) -> P.OwnerChannel:
+        """A person's channel. What people said is back already (_restore): this takes no old message again, including one the node refused, which used its number all the same.
+        The log's owner_seq row is written before the word does anything. Older code wrote only what finished, so those rows count too. seq, save: fleet.py's file for the node."""
         def person(*a: Any) -> dict[str, Any]:
             with self._lock:
                 return self._person(*a)
-        ch = P.OwnerChannel(self.node.name, self.policy, keys, person, self.log.add)
+
+        def kept(numbers: dict[str, int]) -> None:
+            self.log.add("owner_seq", seq=numbers)
+            if save:
+                save(numbers)
+        ch = P.OwnerChannel(self.node.name, self.policy, keys, person, self.log.add, seq, kept)
+        for r in self.log.all("owner_seq"):
+            for k, n in r["seq"].items():
+                ch.seq[k] = max(ch.seq.get(k, 0), n)
         for r in self.log.all("owner_channel"):
-            if (r.get("result") or {}).get("status") == "done":
-                ch.seq[r["role"]] = max(ch.seq.get(r["role"], 0), r["seq"])
+            k = keys.get(r["role"]) if isinstance(r.get("role"), str) else None
+            if k and (r.get("result") or {}).get("status") == "done":
+                ch.seq[k] = max(ch.seq.get(k, 0), r["seq"])
         return ch
 
     def _person(self, verb: str, group: str, name: str, value: float | None) -> dict[str, Any]:
         if verb == "set_limit":
             return self.driver.set_limit(group, name, float(value))
         if verb == "clear_alarm":
-            sim = getattr(self.node, "sim", None)
-            if getattr(sim, "overrides", {}).get("alarm"):
+            ov = getattr(getattr(self.node, "sim", None), "overrides", {})
+            if ov.get("alarm"):
                 return {"status": "blocked", "why": "The alarm is still on."}
-            if not self.stopped:
+            if not self.stopped and "alarm_hold" not in ov:   # a signal over before the next step holds the controller and never reached self.stopped
                 return {"status": "blocked", "why": "No alarm is holding this node."}
             self.stopped = None
             self.log.add("alarm_cleared", ts=self.ts)
             self._controller("clear_stop")
+            if self._kept():
+                self.hand_back()                  # the alarm closed the levers, and with none the controller has every device: a wish or a closed group would stop being kept
             return {"status": "done"}
         if verb == "need_now":
             for c in [c for c in getattr(self.node, "calls", []) if P.group_of(c["tool"]) == group]:
@@ -899,11 +1124,15 @@ class ContextServer:
         """One device leaves the sale, or all of them. With levers open again the controller could use every device, so when all are let go it stands
         down too: writes stop, and the node leaves the sale until a person clears it. A building's agent can't yet release a single group, so a building lets go of everything."""
         node = self.node
+        if target is not None and hasattr(node, "let_go"):
+            return node.let_go(target)            # NodeAgent and BuildingAgent let one call go. What follows is for a node that can't
         if target is None or getattr(node, "zm", None) is not None:
             node.close()
             node.calls = []
             if target is None and getattr(node, "sim", None) is not None:
                 node.sim.rt_override("stop", True)
+            elif target is not None:
+                node.open()                       # with no levers the controller would take back the group the person just asked for: what's left stays shut until the agent opens it
             return
         tools = {c["tool"] for c in node.calls if c["target"] == target}
         node.calls = [c for c in node.calls if c["target"] != target]
@@ -917,16 +1146,7 @@ class ContextServer:
         return {"status": "done", "why": "", "reading": keep, "view": f"{target}: " + ", ".join(f"{k} {v}" for k, v in list(keep.items())[:8]) + "."}
 
     def _sim_limit(self, group: str, name: str, value: float) -> None:
-        sim = self.node.sim
-        if group == "hvac_zones":
-            setattr(sim.ctl.limits, name, value)
-            held = getattr(sim, "overrides", {}).get("comfort") or {}
-            if held.get(name, value) > value:     # the override replaces the limits, so a running call would keep more than the person now allows
-                sim.overrides["comfort"] = {**held, name: value}
-            if name == "max_rise_c":
-                sim.person_rise = value           # a building writes its comfort every step: this stays above that
-        elif group == "energy_storage":
-            sim.R = value / 100.0
+        rt_control.write_limit(self.node.sim, group, name, value)
 
     def _sim_keep_out(self, group: str, out: bool) -> None:
         """A person's "not this group" reaches the controller too, on a node with no agent call running. It stays through offers until the person takes it back."""
@@ -945,9 +1165,15 @@ class ContextServer:
             return
         node.all_open(keep)                       # every device open, the device's own rating still limiting each, and these closed again
 
+    def _sim_hold(self, why: str) -> None:
+        sim = getattr(self.node, "sim", None)
+        if hasattr(sim, "hold_alarm"):
+            sim.hold_alarm(why)
+
     def _sim_clear_stop(self) -> None:
         sim = getattr(self.node, "sim", None)
         if hasattr(sim, "rt_override"):
+            sim.overrides.pop("alarm_hold", None)
             sim.rt_override("stop", False)
 
     # ------------------------------------------------------------------ MCP

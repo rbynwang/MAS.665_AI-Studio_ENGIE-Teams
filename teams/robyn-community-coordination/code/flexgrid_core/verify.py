@@ -5,9 +5,9 @@ Nothing here trusts either party's totals: every number is recomputed from the h
   signatures   every reading verifies against the home key that the coordinator and the utility each pinned on
                first contact (the two pins agree), and the utility counted exactly the usage the home signed
   delivery     the DEG demand-flex settlement re-run on the signed readings and the utility's baselines gives the
-               utility's total to the cent, slot by slot
-  split        the coordinator's pro-rata split adds up to what the utility paid, and each home's share matches its
-               measured delivery
+               utility's bill, and under the 2026 rules its full price too, to the cent, slot by slot
+  split        the coordinator's split adds up to what the utility paid, and each home's share matches its
+               measured delivery under the rule in force (settlement.pay_rule)
   replay       (optional) the offline replay of the same order with the same homes pays the same to the cent; with
                AI agents, it plays what they decided (their signed offers say it) and the homes' answers; within
                0.5 % for an event that a live run reached through an earlier one (the replay starts fresh)
@@ -25,7 +25,7 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
-from . import beckn, config, settlement as st, signing
+from . import beckn, config, meter_check as mc, settlement as st, signing
 from .rt_market import PRICE_LADDER
 
 SLOT_H = beckn.SLOT_MINUTES / 60
@@ -182,7 +182,7 @@ def check(b: dict[str, Any], replay_total: float | None = None) -> dict[str, Any
             counted = u.get("meter_readings", {}).get(h, {}).get(sid, u.get("meter_readings", {}).get(h, {}).get(int(sid)))
             if counted is None or abs(float(counted) - float(perf["usage_kw"])) > 1e-9:
                 miscounted.append(f"{h}/{sid}")
-    counted_n = sum(len(v) for v in u.get("meter_readings", {}).values())
+    counted_n = sum(1 for h, v in u.get("meter_readings", {}).items() for s in v if u.get("owed") is None or str(s) in {str(k) for k in u["owed"].get(h) or {}})
     sig_ok = n > 0 and good == n and not pin_mismatch and not miscounted and counted_n == n
     out.append(_row("signatures", sig_ok,
                     f"{good}/{n} signed readings valid against the {who}' pinned keys; coordinator and {buyer} pinned "
@@ -193,9 +193,10 @@ def check(b: dict[str, Any], replay_total: float | None = None) -> dict[str, Any
 
     # 3. delivery: re-run the DEG settlement on the signed readings and the utility's baselines
     meters: dict[str, dict[int, dict[str, float]]] = {}
+    owed = u.get("owed")
     for h, rs in signed.items():
         for sid, body in rs.items():
-            if f"{h}/{sid}" in bad:
+            if f"{h}/{sid}" in bad or (owed is not None and sid not in {str(k) for k in owed.get(h) or {}}):
                 continue
             base = u.get("baselines", {}).get(h, {}).get(sid, {}).get("BASELINE")
             if base is not None and int(sid) not in (u.get("abnormal") or {}).get(h, ()):
@@ -204,12 +205,14 @@ def check(b: dict[str, Any], replay_total: float | None = None) -> dict[str, Any
                 if st.MARKET:
                     perf = body["message"]["performance"]
                     meters[h][int(sid)]["BATT"] = float(perf.get("battery_kw") or 0.0)
-                    meters[h][int(sid)]["BASELINE"] = st.adjusted(base, perf.get("pre_kw"), (u.get("pre_baselines") or {}).get(h))
+                    pre = (u["meter_pre"] or {}).get(h) if "meter_pre" in u else perf.get("pre_kw")      # the first that passed: a later one can't move a node's own baseline
+                    meters[h][int(sid)]["BASELINE"] = st.adjusted(base, pre, (u.get("pre_baselines") or {}).get(h))
+    if st.MARKET:
+        mc.limit(meters, u.get("solar"))                    # the same limits, worked out again here
     offered = {int(k): float(v) for k, v in (u.get("offered") or {}).items()}
     # a building node's meter: at most 1.2x what it committed in each half hour, from its own signed readings
     bl = set(c.get("buildings") or [])
-    caps = {h: {int(sid): st.BUILDING_CAP_X * float(((body or {}).get("message") or {}).get("performance", {})
-                                                    .get("committed_kw") or 0.0)
+    caps = {h: {int(sid): st.BUILDING_CAP_X * mc.against_owed(float(((body or {}).get("message") or {}).get("performance", {}).get("committed_kw") or 0.0), (owed or {}).get(h), sid)
                 for sid, body in rs.items() if f"{h}/{sid}" not in bad} for h, rs in signed.items() if h in bl}
     mine = st.deg_settle(need["slots"], offered, meters, hours=SLOT_H, currency=need["currency"], caps=caps or None,
                          share=u.get("share"), capped=u.get("capped"))
@@ -218,12 +221,12 @@ def check(b: dict[str, Any], replay_total: float | None = None) -> dict[str, Any
     for s, r in zip(need["slots"], mine["components"]):
         slots.append({"slot": s["start"][11:], "requested_kw": s["kw_requested"], "contracted_kw": r["offered"],
                       "delivered_kw": r["delivered"], "paid_kw": r["eligible"], "usd": r["net"]})
-    same_total = abs(mine["total"] - float(theirs.get("total", -1))) < 0.005
+    same_total = abs(mine["total"] - float(theirs.get("total", -1))) < 0.005 and abs(float(mine.get("full_price_usd", 0.0)) - float(theirs.get("full_price_usd", mine.get("full_price_usd", 0.0)))) < 0.005
     short = [x for x in slots if x["delivered_kw"] < x["contracted_kw"] - 1e-6]
     out.append(_row("delivery", same_total,
                     f"recomputed ${mine['total']:.2f} vs {buyer} ${float(theirs.get('total', 0)):.2f}; "
                     f"{len(slots) - len(short)}/{len(slots)} slots delivered at least the contracted kW "
-                    f"(measured against the utility's 3-of-14 baseline)", slots=slots))
+                    f"(measured against the utility's baseline: {st.baseline_rule()})", slots=slots))
 
     # 4. split: the community's payout adds up and follows measured delivery
     res = c.get("result") or {}
@@ -243,7 +246,7 @@ def check(b: dict[str, Any], replay_total: float | None = None) -> dict[str, Any
         kwcap = {h: {str(k): float(v) for k, v in caps[h].items()} for h in caps_kwh if h in caps}   # as the buyer counted them: its readings
         val = {h: st.meter_kwh(m, SLOT_H, kwcap.get(h), h in kwcap, h) for h, m in meters.items()}
         st.trim_called(val, u.get("capped") or {}, SLOT_H)
-        expect = st.share_out(seller, val)["per_home"]
+        expect = st.share_out(seller, float(res.get("full_price_usd", seller)), val)["per_home"]
         x_of = st.price_book()["x"]
         rate = float((res.get("split") or {}).get("usd_per_kwh") or 0.0)
         for h, v in ((res.get("split") or {}).get("premium_usd") or {}).items():    # a gap's helper, paid its rising price from the keep
@@ -254,8 +257,8 @@ def check(b: dict[str, Any], replay_total: float | None = None) -> dict[str, Any
     split_ok = bool(sp) and abs(paid_total + fee - seller) < 0.01 and abs(this_buyer - mine["total"]) < 0.005 \
         and not off and c.get("phase") == "done" and u.get("status") == "COMPLETE"
     out.append(_row("split", split_ok,
-                    f"{len(sp)} {who} paid ${paid_total:.2f} (+ fee ${fee:.2f}) of the ${seller:.2f} the buyers paid; "
-                    f"{len(sp) - len(off)}/{len(sp)} shares match measured delivery pro rata; settled once "
+                    f"{len(sp)} {who} paid ${paid_total:.2f} (+ fee ${fee:.2f}, {fee / seller if seller > 0 else 0.0:.2%}) of the ${seller:.2f} the buyers paid; "
+                    f"{len(sp) - len(off)}/{len(sp)} shares match the rule in force; settled once "
                     f"(coordinator {c.get('phase')}, {buyer} {u.get('status')})"))
 
     # 5. replay (optional): the same order, the same homes (and what their AI agents decided), offline. To the cent

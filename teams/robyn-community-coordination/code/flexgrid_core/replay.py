@@ -9,6 +9,8 @@ Clock modes, identical on every machine with an NTP-synced clock:
   * looping (loop_days > 0): step k = wall_seconds // step_seconds, wrapped every loop_days
   * event run (loop_days = 0, `at` + `at_wall`): dataset time `at` is shown at unix time `at_wall`,
     then one step every step_seconds. Every agent given the same three numbers plays the same step.
+  * held (`hold`): dataset time `at` is shown until the clock is set again. The coordinator's conductor holds every clock at
+    each step until every agent due there has answered, then sets the next (coordinator.py, cfg clock_waits).
 """
 from __future__ import annotations
 
@@ -110,9 +112,10 @@ class Replay:
         self.configure(start, step_seconds, loop_days)
 
     def configure(self, start: str, step_seconds: float, loop_days: int = 1, at: str | None = None,
-                  at_wall: float | None = None) -> None:
+                  at_wall: float | None = None, hold: bool = False) -> None:
         """`at`: jump so that the current step shows that dataset time. With `at_wall` (unix seconds) and
-        loop_days = 0 the jump is absolute, so agents configured at different moments still agree."""
+        loop_days = 0 the jump is absolute, so agents configured at different moments still agree. hold: stay on that
+        step until the clock is set again."""
         if start not in self.index:
             raise ValueError(f"replay start {start!r} not in dataset")
         step, loop = float(step_seconds), int(loop_days)
@@ -133,11 +136,17 @@ class Replay:
         wall0 = aw if aw is not None else (0.0 if loop > 0 else time.time())
         # one assignment, so a thread reading the clock while it changes (a change of speed mid-run) sees the old
         # line or the new one, never half of each
-        self._line = (wall0, step, i0, loop)
+        self._line = (wall0, step, i0, loop, i0 if hold else None)
         self.start, self.step_seconds, self.loop_days, self.i0, self.at_wall, self.wall0 = start, step, loop, i0, aw, wall0
 
+    @property
+    def held(self) -> bool:
+        return self._line[4] is not None
+
     def current(self) -> int:
-        wall0, step, i0, loop = self._line
+        wall0, step, i0, loop, held = self._line
+        if held is not None:
+            return max(0, min(held, len(self.rows) - 1))
         k = int((time.time() - wall0) // step)
         if loop > 0:
             k %= loop * 96
@@ -151,7 +160,7 @@ class Replay:
         told up to 2 s before T: an agent still on the fast line after T would play on and then step back.
         Returns {"send": wall time to tell them, "start", "at", "at_wall": T, "step_seconds": new, "loop_days": 0}."""
         now = time.time() if now is None else now
-        wall0, old, i0, _ = self._line
+        wall0, old, i0, _, _ = self._line
         lead = 0.7 * new if new < old else min(2.0, 0.9 * new)
         T = wall0 + (math.floor((now - wall0) / old) + 1) * old
         while T - lead < now + 0.05:
@@ -161,7 +170,7 @@ class Replay:
 
     def clock(self) -> dict[str, Any]:
         return {"start": self.start, "step_seconds": self.step_seconds, "loop_days": self.loop_days,
-                "at_wall": self.at_wall, "now": self.ts(self.current())}
+                "at_wall": self.at_wall, "now": self.ts(self.current()), "held": self.held}
 
     def row(self, i: int) -> dict[str, Any]:
         r = self.rows[max(0, min(i, len(self.rows) - 1))]

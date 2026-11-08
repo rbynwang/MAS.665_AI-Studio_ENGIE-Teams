@@ -4,18 +4,18 @@ It plays the provider node of the DEG demand-flex flow (beckn/DEG docs/implement
   discover(date)  -> on_discover   the next day's flex needs from data/grid_events_2023.json, once its notice time
                                    (10:00 the day before) has passed
   select / init / confirm -> on_select / on_init / on_confirm (contract DRAFT -> ACTIVE)
-  update (meters) -> on_status baselines   Ameren Illinois Peak Time Rewards method, from each meter's history
+  update (meters) -> on_status baselines   settlement.baseline_rule(), from each meter's history
   on_status (meter reading) from each home -> checked against the home's pinned key and kept
   update (readings done) -> on_status actuals, then on_status settled (the DEG demand-flex rego, ported)
-Meter history = each enrolled home replayed in its default mode over the days the Rider PTR baseline needs (the 14
-previous non-holiday, non-event days, plus one day of warm-up; the utility's own meter data in this simulation).
+Meter history = each enrolled home replayed in its default mode over the days the baseline needs, plus one day of
+warm-up (the utility's own meter data in this simulation).
 Actual usage comes from each home's signed readings, sent by the home straight to the utility (the coordinator never
 relays them, so it cannot alter them); a real utility reads its own meters.
 Who may do what: only the aggregators in `utility_aggregators` (config, default ["coordinator"]) discover and
 contract, every follow-up must come from the aggregator that selected, a meter is enrolled in at most one open
-contract per event, and a reading counts only for the ACTIVE contract its meter is enrolled in. A select, init,
+contract per event, and a reading counts only for the contract its meter is enrolled in, active or settled. A select, init,
 confirm or update delivered again (NANDA Town delivers at least once) changes nothing: a confirmed contract keeps its
-meters and capacity, and a settled one is never reopened or settled twice.
+meters and capacity, and a settled one is settled again only on readings that came after it (a top-up).
 
   flexgrid-utility run        # Town agent "utility" + status API on 127.0.0.1:7873
 """
@@ -26,13 +26,13 @@ import json
 import logging
 import threading
 import time
-import uuid
 from collections import Counter, deque
 from typing import Any
 
-from . import beckn, config, settlement as st, signing, wire
+from . import beckn, config, doors, ids, keep, settlement as st, signing, wire
 from .adapters.simulated import SimulatedHome
 from .replay import Replay
+from . import meter_check as mc
 from .town import InboxPoller, LagMeter, TownSession
 
 log = logging.getLogger("flexgrid-utility")
@@ -46,14 +46,15 @@ def _meter_cfg(home: dict[str, Any], ev_max: float) -> dict[str, Any]:
 
 
 class Utility:
-    def __init__(self):
+    def __init__(self, key_file: str = "utility.key"):
+        """key_file: each buyer loads its own key and no other's, so two buyers starting together share no file."""
         self.cfg = config.load()
         self.name = self.cfg.get("utility_name", "utility")
-        self.key = signing.load_or_create(config.CONFIG_DIR / "secrets" / "utility.key")
+        self.key = signing.load_or_create(config.CONFIG_DIR / "secrets" / key_file)
         self.pub = signing.public_hex(self.key)
         tok = config.secret("utility_town_token") or config.secret("town_token")
         self.town = TownSession(self.cfg["town_url"], self.cfg["town_run_id"], self.name, tok)
-        self.catalog = json.loads(config.events_file().read_text())["message"]["catalogs"][0]
+        self.catalog = st.catalog_terms(json.loads(config.events_file().read_text())["message"]["catalogs"][0])
         self.fleet = {h["name"]: h for h in json.loads(config.data_path("fleet_v2.json").read_text())["homes"]}
         from . import building                   # the building nodes this config enables: their meters' history too
         self.fleet.update({b["name"]: building.meter_entry(b) for b in building.enabled(self.cfg)})
@@ -64,6 +65,7 @@ class Utility:
         self.orders: dict[str, dict[str, Any]] = {}          # event_id -> the buyer agent's order, signed by us
         self.contracts: dict[str, dict[str, Any]] = {}       # transactionId -> contract state
         self.events = deque(maxlen=300)
+        self.unsent: deque = deque()                         # replies Town didn't take: sent again on each tick, under the same id
         self.event_days = {beckn.need_from_catalog(r, o)["window_start"][:10]
                            for r, o in self._pairs()}
         self.lock = threading.RLock()
@@ -72,8 +74,10 @@ class Utility:
         # Town names allowed to discover and contract with this buyer (the aggregators it has enrolled). Homes only
         # send meter readings, and a reading counts only for the ACTIVE contract its meter is enrolled in.
         self.aggregators = set(c.get("utility_aggregators") or ["coordinator"])
+        self.keeper = None                                   # keep.for_buyer: live only
         self.run_wall = 0.0                                  # when this run started (POST /demo/reset): older messages
                                                              # still in the inbox belong to the run before
+        self.play = ids.new_play()                           # this play of the day, in every id it sends (ids.py): new at each reset, kept through a restart
         from .rt_buyer import GridWatch                      # calls during the day, and their settlement
         self.watch = GridWatch(self)
 
@@ -91,6 +95,7 @@ class Utility:
     ORDER_MAX_KW, ORDER_MAX_PRICE, ORDER_MAX_H = 20000.0, 5.0, 4.0
     ORDER_PREFIX = "flex-need-"                         # the event id of a day's order (the catalog's ids)
     PARTICIPANT = "utility-or-engie-mock"               # who the contract names as the buyer
+    CLASS_RATES = False                                 # a call at each class's rate. On the one-buyer path a call pays its nodes all of it, pro rata, so there it stays at the call's price
 
     @staticmethod
     def notice_of(date: str) -> str:
@@ -176,7 +181,7 @@ class Utility:
                            for k in range(n_slots)]
         offer = json.loads(json.dumps(to))
         offer.update({"id": f"offer-{date}", "resourceIds": [eid],
-                      "descriptor": {"name": f"Buyer order {date}", "shortDesc": f"${price:g}/kWh reduced, measured against baseline"},
+                      "descriptor": {"name": f"Buyer order {date}", "shortDesc": f"{st.up_to()}${price:g}/kWh reduced, measured against baseline"},
                       "validity": {"endDate": utc(f"{beckn.add_minutes(f'{date} 00:00', -1440)[:10]} 16:00")}})
         for x in offer["offerAttributes"].get("inputs") or []:
             if x.get("role") == "buyer":
@@ -214,7 +219,7 @@ class Utility:
                 "baselines": {m: {s: v for s, v in d.items() if s != "_days"} for m, d in bases.items()},
                 "pre_baselines": ct.get("pre_baselines") or {},
                 "meter_readings": {m: {str(s): v for s, v in d.items()} for m, d in ct.get("meter_readings", {}).items()},
-                "rejected_readings": ct.get("rejected_readings", 0), "settlement": ct.get("settlement"),
+                "rejected_readings": ct.get("rejected_readings", 0), "settlement": ct.get("settlement"), "owed": ct.get("owed"), "solar": ct.get("solar"), "meter_pre": ct.get("meter_pre") or {},
                 "buyer_review": ct.get("buyer_review"),
                 **({"share": {str(k): v for k, v in ct["share"].items()}} if ct.get("share") else {}),
                 **({"capped": {str(k): v for k, v in ct["capped"].items()}} if ct.get("capped") else {}),
@@ -239,16 +244,32 @@ class Utility:
     def now(self) -> str:
         return self.clock.ts(self.clock.current())
 
-    def reply(self, to: str, action: str, txn: str, message: dict[str, Any]) -> None:
+    def reply(self, to: str, action: str, txn: str, message: dict[str, Any], *key: Any, asked: str | None = None) -> None:
+        """What's sent to the coordinator. `asked`: what this answers (ids.asked). `key`: what it is, or by default what it says, as with a call's settlement, where each top-up says
+        something new. A settlement names its round: a second one in a round that says otherwise would be a fault, and Town refuses it, loudly."""
         # a status (baselines, actuals, the settlement) is a statement of fact: valid for a day (beckn.TTL_EVIDENCE_S)
         body = beckn.make(action, sender=self.name, receiver=to, transaction_id=txn, message=message, key=self.key,
                           sender_role="bpp", ttl_s=beckn.TTL_EVIDENCE_S if action == "on_status" else None)
-        self.town.send(to, beckn.kind(action), body, f"{self.name}:{action}:{txn}:{uuid.uuid4().hex[:6]}")
+        item = (to, beckn.kind(action), body, ids.sealed(None if asked else self.key, asked or self.play, self.name, to, action, txn, *(key or (ids.digest(message),))))
+        if not self._post(*item):
+            self.unsent.append(item)
+
+    def _post(self, to: str, kind: str, body: dict[str, Any], mid: str) -> bool:
+        """One send to Town. False if it failed, and it's sent again on a later tick: the first day of 6 Nov lost $21,388.67 to one failed send of a settlement."""
+        try:
+            out = self.town.send(to, kind, body, mid)
+        except Exception as exc:                            # noqa: BLE001  Town away for a moment, or its tunnel
+            self.event("send_failed", to=to, message_kind=kind, error=str(exc)[:160])
+            return False
+        if isinstance(out, dict) and out.get("duplicate"):    # Town refused it: see town.send
+            self.event("send_dropped", to=to, message_kind=kind, message_id=mid)
+        return True
 
     # ------------------------------------------------------------------ baselines
     def baselines(self, ct: dict[str, Any], meters: list[str]) -> dict[str, dict[str, dict[str, float]]]:
         """Each meter's baseline per slot from its own history (the utility's meter data, before the event).
-        Always the Ameren Rider PTR baseline (mean of the 3 highest of the 14 previous non-holiday, non-event days).
+        Always the baseline in force (settlement.baseline_rule). Under the 2026 rules that's the last 10 days of the same kind, otherwise the
+        Ameren Rider PTR baseline (mean of the 3 highest of the 14 previous non-holiday, non-event days).
         With baseline_method "weather_regression" the contract also fixes, per meter and slot, a line fitted to the
         meter's usage against the day's highest temperature over the 30 previous such days; the settlement then uses
         that line at the event day's measured highest temperature (tools/baseline_eval.py: it pays for 1.06x the
@@ -295,6 +316,7 @@ class Utility:
                     if all(x is not None for x in xs):
                         pre.append(-sum(xs) / 4)
                 ct.setdefault("pre_baselines", {})[m] = round(sum(pre) / len(pre), 3) if pre else None
+                ct.setdefault("solar", {})[m] = mc.recent_solar(rp, days, need["slots"])
             out[m]["_days"] = b["days"]
             if regression:
                 tmax = self._tmax(rp, [d.isoformat() for d in reg_days])
@@ -319,7 +341,7 @@ class Utility:
         return out
 
     def settlement_baselines(self, ct: dict[str, Any]) -> dict[str, dict[str, dict[str, float]]]:
-        """The baselines the settlement uses: Rider PTR as sent with the contract, or, under weather_regression, each
+        """The baselines the settlement uses: those sent with the contract, or, under weather_regression, each
         meter's line at the event day's measured highest temperature (known only once the day is over)."""
         models = ct.get("baseline_models")
         if not models:
@@ -348,10 +370,12 @@ class Utility:
         return [m for m in requested if m not in held]
 
     def _contract_of_meter(self, meter: str, event_id: str | None) -> dict[str, Any] | None:
-        """The ACTIVE contract for this event that the meter is enrolled in (at most one, see _enroll)."""
-        return next((c for c in self.contracts.values() if c.get("status") == "ACTIVE"
-                     and event_id in (c.get("need", {}).get("event_id"), c.get("community_event"))
-                     and meter in c.get("meters", [])), None)
+        """The ACTIVE contract for this event that the meter is enrolled in (at most one, see _enroll). Else the settled one, since a reading
+        that comes after the settlement is still owed for."""
+        cs = [c for c in self.contracts.values() if c.get("status") in ("ACTIVE", "COMPLETE")
+              and event_id in (c.get("need", {}).get("event_id"), c.get("community_event"))
+              and meter in c.get("meters", [])]
+        return next((c for c in cs if c["status"] == "ACTIVE"), cs[-1] if cs else None)
 
     @staticmethod
     def _pool_terms(ct: dict[str, Any], c: dict[str, Any]) -> None:
@@ -364,43 +388,44 @@ class Utility:
         ct["community_event"] = c.get("community_event")
         ct["deposit_held_usd"] = float(c.get("deposit_held_usd") or 0.0)
 
-    def _repeat(self, ct: dict[str, Any], sender: str, txn: str, action: str) -> str:
+    def _repeat(self, ct: dict[str, Any], sender: str, txn: str, action: str, asked: str | None = None) -> str:
         """A select / init / confirm / update for a contract that has moved past it: NANDA Town delivered it again, or
         the aggregator is retrying because a reply was lost. Nothing changes; an open contract is answered as it
         stands (so a retrying aggregator can carry on), a settled or superseded one gets no answer."""
         status = ct.get("status")
         if status in ("DRAFT", "ACTIVE") and action != "on_status":
-            self.reply(sender, action, txn, {"contract": ct["contract"]})
+            self.reply(sender, action, txn, {"contract": ct["contract"]}, "contract", asked=asked)
             return f"{action} {status} (repeat, nothing changed)"
         if status == "COMPLETE":
             return "already settled"
-        return f"contract {str(status).lower()}: nothing to do"
+        return beckn.Refused(f"contract {str(status).lower()}: nothing to do")
 
     def handle(self, kind: str, sender: str, body: dict[str, Any]) -> str:
         late = beckn.expired(body, default_ttl=float(self.cfg.get("max_message_age_s", 900)))
         if late:                                            # waited in the inbox past its validity: drop it
             self.event("expired_skipped", sender=sender, message_kind=kind, late_s=round(late))
-            return "expired: not acted on"
+            return beckn.Refused("expired: not acted on")
         sent = ((body or {}).get("context") or {}).get("sentWall") if isinstance(body, dict) else None
         if isinstance(sent, (int, float)) and sent < self.run_wall:
             # a run before this one (a demo reset since): its question about another day must not be answered into
             # this run's record (live 1 Nov 2026: "Sat 4 Jul: no event that day" at the start of the next run)
             self.event("stale_skipped", sender=sender, message_kind=kind)
-            return "sent before this run started: not acted on"
+            return beckn.Refused("sent before this run started: not acted on")
         if beckn.action_of(kind) == "on_status" and "batch" in (body.get("message") or {}):
-            return "; ".join(str(self.handle(kind, sender, b)) for b in body["message"]["batch"])[:300]
+            return beckn.of_batch([self._one_of_batch(kind, sender, b) for b in body["message"]["batch"]])
         if beckn.action_of(kind) == "on_status" and "performance" in (body.get("message") or {}):
             return self.meter_reading(sender, body)
         if sender not in self.aggregators:                # only enrolled aggregators discover and contract
             self.event("sender_refused", sender=sender, message_kind=kind)
-            return "rejected: not an enrolled aggregator"
+            return beckn.Refused("rejected: not an enrolled aggregator")
         signer = body.get("signer", "")
         self.pins.setdefault(sender, signer)
         if not beckn.check(body, self.pins[sender]):
-            return "rejected: bad signature"
+            return beckn.Refused("rejected: bad signature")
         act = beckn.action_of(kind)
         txn = body["context"]["transactionId"]
         m = body["message"]
+        asked = ids.asked(body)
         rt = self.watch.handle(act, sender, body)
         if rt is not None:
             return rt
@@ -414,15 +439,15 @@ class Utility:
                     res.append(r); offs.append(o)
             cat = {**{k: v for k, v in self.catalog.items() if k not in ("resources", "offers")},
                    "resources": res, "offers": offs}
-            self.reply(sender, "on_discover", txn, {"catalogs": [cat] if res else []})
+            self.reply(sender, "on_discover", txn, {"catalogs": [cat] if res else []}, "catalogs", asked=asked)
             self.event("on_discover", date=date, needs=[r["id"] for r in res])
             return f"{len(res)} needs for {date}"
         if act == "select":
             prev = self.contracts.get(txn)
             if prev and prev.get("coordinator", sender) != sender:
-                return "rejected: this transaction belongs to another aggregator"
+                return beckn.Refused("rejected: this transaction belongs to another aggregator")
             if prev and prev.get("status") in ("DRAFT", "ACTIVE", "COMPLETE", "SUPERSEDED"):
-                return self._repeat(prev, sender, txn, "on_select")    # delivered again: the contract stays as it is
+                return self._repeat(prev, sender, txn, "on_select", asked)    # delivered again: the contract stays as it is
             ct = self.contracts.setdefault(txn, {"coordinator": sender, "status": "NEW"})
             rid = m["contract"]["commitments"][0]["resources"][0]["id"]
             r, o = next((r, o) for r, o in self._pairs() if r["id"] == rid)
@@ -437,50 +462,54 @@ class Utility:
                                                "roles": [{"role": "buyer", "participantId": "utility-or-engie-mock"},
                                                          {"role": "seller", "participantId": None}]}}
             ct["contract"] = contract
-            self.reply(sender, "on_select", txn, {"contract": contract})
+            self.reply(sender, "on_select", txn, {"contract": contract}, "contract", asked=asked)
             return "on_select DRAFT"
         ct = self.contracts.get(txn)
         if not ct or "need" not in ct:
-            return "unknown transaction"
+            return beckn.Refused("unknown transaction")
         if ct.get("coordinator") != sender:                # follow-ups only from the aggregator that selected
             self.event("sender_refused", sender=sender, message_kind=kind, transaction=txn)
-            return "rejected: not this contract's aggregator"
+            return beckn.Refused("rejected: not this contract's aggregator")
         if ct.get("status") == "SUPERSEDED":
-            return "contract superseded by a newer transaction"
+            return beckn.Refused("contract superseded by a newer transaction")
         if act == "init":
             if ct.get("status") != "DRAFT":               # init again after confirm (redelivery or the aggregator's
-                return self._repeat(ct, sender, txn, "on_init")    # retry): the confirmed meters and capacity stay
+                return self._repeat(ct, sender, txn, "on_init", asked)    # retry): the confirmed meters and capacity stay
             c = m["contract"]
             ct["contract"]["contractAttributes"]["roles"][1]["participantId"] = c.get("seller")
             ct.update({"meters": self._enroll(ct, c.get("participatingMeters", [])),
                        "offered": {int(k): float(v) for k, v in c.get("capacityOffered", {}).items()}})
             self._pool_terms(ct, c)
-            self.reply(sender, "on_init", txn, {"contract": ct["contract"]})
+            self.reply(sender, "on_init", txn, {"contract": ct["contract"]}, "contract", asked=asked)
             return "on_init"
         if act == "confirm":
             if ct.get("status") == "COMPLETE":
-                return self._repeat(ct, sender, txn, "on_confirm")  # a settled contract is never reopened
+                return self._repeat(ct, sender, txn, "on_confirm", asked)  # a settled contract is never reopened
             ct["contract"]["status"] = ct["status"] = "ACTIVE"
-            self.reply(sender, "on_confirm", txn, {"contract": ct["contract"]})
+            self.reply(sender, "on_confirm", txn, {"contract": ct["contract"]}, "contract", asked=asked)
             self.event("contract_active", event_id=ct["need"]["event_id"], meters=len(ct.get("meters", [])),
                        offered=ct.get("offered"))
             return "on_confirm ACTIVE"
         if act == "update" and "telemetry_done" in m:
             if ct.get("status") == "COMPLETE":
+                if ct.get("settled_msg"):                 # the coordinator is still waiting for it, or this is a repeat, which it ignores
+                    self.reply(sender, "on_status", txn, ct["settled_msg"], "settled", ct.get("top_ups", 0), asked=asked)
                 return "already settled"
             ct["settle_to"] = (sender, txn)
             ct["called_slots"] = m["telemetry_done"].get("called_slots") or []
             ct["abnormal"] = {h: [int(x) for x in v] for h, v in (m["telemetry_done"].get("abnormal") or {}).items()}
+            ct["owed"] = mc.owed_of(m["telemetry_done"].get("owed"))
             if self._readings_complete(ct):
                 return self.settle(ct)
             if not ct.get("settle_requested"):
                 ct["settle_requested"] = True             # settle anyway once the wait is over (replay clock, see tick)
                 ct["settle_by"] = beckn.add_minutes(self.now(), float(self.cfg.get("utility_settle_wait_minutes", 30)))
                 ct["settle_requested_wall"] = time.time()
+                self.reply(sender, "on_status", txn, {"readings_lacking": self._lacking(ct)}, "lacking", asked=asked)   # only this buyer knows what reached it
             return "waiting for the last meter readings"
         if act == "update":
             if ct.get("status") == "COMPLETE":
-                return self._repeat(ct, sender, txn, "on_status")
+                return self._repeat(ct, sender, txn, "on_status", asked)
             c = m["contract"]
             ct["meters"] = self._enroll(ct, c.get("participatingMeters", ct.get("meters", [])))
             ct["offered"] = {int(k): float(v) for k, v in c.get("capacityOffered", {}).items()} or ct.get("offered", {})
@@ -490,60 +519,80 @@ class Utility:
             ct["baselines"] = self.baselines(ct, ct["meters"])
             self.reply(sender, "on_status", txn, {"contract": {"id": ct["contract"]["id"]},
                                                   "performance": {"kind": "baselines", "methodology":
-                                                                  ("Ameren PTR: 3 highest of the 14 previous "
-                                                                   "non-holiday, non-event days" if config.dataset_meta().get("name") == "il2023"
-                                                                   else "3 highest of the 14 previous non-holiday, non-event days "
-                                                                        "(the Rider PTR method)") if not ct.get("baseline_models") else
+                                                                  st.baseline_rule() if not ct.get("baseline_models") else
                                                                   "weather-normalized: per meter and slot, usage against the day's "
                                                                   "highest temperature over the 30 previous non-holiday, non-event "
                                                                   "days, settled at the event day's measured highest temperature "
-                                                                  "(the Rider PTR values below are for reference)",
+                                                                  f"(the values below, {st.baseline_rule()}, are for reference)",
                                                                   "models": ct.get("baseline_models") or None,
                                                                   "meters": {k: {s: v for s, v in d.items() if s != "_days"}
-                                                                             for k, d in ct["baselines"].items()}}})
+                                                                             for k, d in ct["baselines"].items()}}}, "baselines", asked=asked)
             self.event("baselines_sent", event_id=ct["need"]["event_id"], meters=len(ct["baselines"]))
             return f"baselines for {len(ct['baselines'])} meters"
-        return f"ignored {kind}"
+        return beckn.Refused(f"ignored {kind}")
 
     # ------------------------------------------------------------------ meter data and settlement
+    def _one_of_batch(self, kind: str, sender: str, body: dict[str, Any]) -> str:
+        """A reading can set off the settlement. Whatever goes wrong there, the readings behind it in the envelope still count."""
+        try:
+            out = self.handle(kind, sender, body)
+            return out if isinstance(out, str) else str(out)
+        except Exception as exc:                            # noqa: BLE001
+            self.event("reading_error", home=sender, error=str(exc)[:200])
+            log.exception("a reading from %s", sender)
+            return beckn.Refused(f"error: {str(exc)[:80]}")
+
     def meter_reading(self, sender: str, body: dict[str, Any]) -> str:
         """A home's own signed reading for one slot (the utility's meter data). Checked against the key the utility
         pinned for that meter on first contact; a reading changed on the way is counted and thrown out."""
         r = body["message"]["performance"]
         self.traffic_homes["on_status"] += 1                 # the monitor counts messages; homes -> utility only here
+        if not isinstance(r, dict) or not isinstance(r.get("event_id"), str):
+            self.event("reading_unmatched", home=sender, event_id=None)
+            return beckn.Refused("reading ignored: it names no event")
         with self.lock:
             if r.get("event_id") in self.watch.calls:        # a half hour of a call the home was dispatched for
                 ok = self.watch.reading(sender, body)
-                wire.note("recv", sender, self.name, "on_status", body, ok=not str(ok).startswith("rejected"), sim=self.now())
+                wire.note("recv", sender, self.name, "on_status", body, ok=not isinstance(ok, beckn.Refused), sim=self.now())
                 return ok
             ct = self._contract_of_meter(sender, r.get("event_id"))   # the ACTIVE contract this meter is enrolled in
             if not ct:
                 self.event("reading_unmatched", home=sender, event_id=r.get("event_id"))
-                return "reading ignored: this meter is in no active contract for that event"
+                return beckn.Refused("reading ignored: this meter is in no active contract for that event")
             pin = self.pins.setdefault(sender, body.get("signer", ""))
             ok = beckn.check(body, pin) and r.get("home") == sender
             wire.note("recv", sender, self.name, "on_status", body, ok=ok, sim=self.now())
             if not ok:
                 ct["rejected_readings"] = ct.get("rejected_readings", 0) + 1
                 self.event("reading_rejected", home=sender, event_id=r.get("event_id"))
-                return "rejected: bad signature"
-            ct.setdefault("meter_readings", {}).setdefault(sender, {})[int(r["slot_id"])] = float(r["usage_kw"])
+                return beckn.Refused("rejected: bad signature")
+            why = mc.buyer_refuses(ct, sender, r, self.event)   # what can't be true never reaches the money, and it's counted
+            if why:
+                return why
+            pre = mc.pre_kw(ct, sender, r, self.event)
+            if ct.get("status") == "COMPLETE" and int(r["slot_id"]) not in ct.get("meter_readings", {}).get(sender, {}):
+                ct["late_readings"], ct["late_wall"] = ct.get("late_readings", 0) + 1, time.time()
+            ct.setdefault("meter_readings", {}).setdefault(sender, {}).setdefault(int(r["slot_id"]), float(r["usage_kw"]))     # the first of a slot stands: small repeats can't walk it anywhere
             ct.setdefault("meter_committed", {}).setdefault(sender, {})[int(r["slot_id"])] = float(r.get("committed_kw") or 0.0)
-            ct.setdefault("meter_batt", {}).setdefault(sender, {})[int(r["slot_id"])] = float(r.get("battery_kw") or 0.0)
-            if r.get("pre_kw") is not None:
-                ct.setdefault("meter_pre", {})[sender] = float(r["pre_kw"])
+            ct.setdefault("meter_batt", {}).setdefault(sender, {}).setdefault(int(r["slot_id"]), float(r.get("battery_kw") or 0.0))
+            if pre is not None:
+                ct.setdefault("meter_pre", {})[sender] = pre
             ct["last_reading_wall"] = time.time()
             if ct.get("settle_requested") and ct.get("status") != "COMPLETE" and self._readings_complete(ct):
                 return self.settle(ct)
             return f"reading {sender} slot {r['slot_id']}"
 
-    def _readings_complete(self, ct: dict[str, Any]) -> bool:
-        """Every participating meter has a reading for every slot it committed to (a home with no commitment in a
+    def _lacking(self, ct: dict[str, Any]) -> dict[str, list[int]]:
+        """The slots each participating meter committed to that this buyer has no reading for (a home with no commitment in a
         slot sends no reading for it). Without the coordinator's per-meter slots: every slot of the window."""
         got = ct.get("meter_readings", {})
         every = [int(s["id"]) for s in ct["need"]["slots"]]
         slots = ct.get("meter_slots") or {}
-        return all(set(slots.get(m, every)) <= set(got.get(m, {})) for m in ct.get("meters", []))
+        out = {m: sorted(set(slots.get(m, every)) - set(got.get(m, {})) - set((ct.get("rejected_slots") or {}).get(m, {}))) for m in ct.get("meters", [])}   # a reading refused came: nobody waits for another
+        return {m: v for m, v in out.items() if v}
+
+    def _readings_complete(self, ct: dict[str, Any]) -> bool:
+        return not self._lacking(ct)
 
     def tick(self) -> None:
         """Settle a contract whose readings are still incomplete once its wait (replay minutes) is over and no reading
@@ -552,16 +601,27 @@ class Utility:
         fast the replay clock runs or however far it jumped. 30 s for the live service (main below), 0 in-process
         (the tests and the simulations deliver every message at once, on a virtual clock)."""
         with self.lock:
-            self.watch.tick()
+            while self.unsent and self._post(*self.unsent[0]):
+                self.unsent.popleft()
+            try:
+                self.watch.tick()
+            except Exception as exc:                      # noqa: BLE001  the sale's settlement below doesn't wait on the calls
+                self.event("tick_error", error=str(exc)[:200])
             now = self.now()
             quiet = float(self.cfg.get("utility_settle_quiet_s", 0.0))
             for ct in self.contracts.values():
                 last = max(ct.get("last_reading_wall", 0.0), ct.get("settle_requested_wall", 0.0))
-                if ct.get("settle_requested") and ct.get("status") == "ACTIVE" and now >= ct.get("settle_by", now) \
-                        and time.time() - last >= quiet:
-                    self.event("settle_late", event_id=ct["need"]["event_id"],
-                               readings=sum(len(v) for v in ct.get("meter_readings", {}).values()))
-                    self.settle(ct)
+                try:                                      # one contract that can't be settled doesn't hold up the next
+                    if ct.get("settle_requested") and ct.get("status") == "ACTIVE" and now >= ct.get("settle_by", now) \
+                            and time.time() - last >= quiet:
+                        self.event("settle_late", event_id=ct["need"]["event_id"],
+                                   readings=sum(len(v) for v in ct.get("meter_readings", {}).values()))
+                        self.settle(ct)
+                    if ct.get("status") == "COMPLETE" and ct.get("late_readings") and time.time() - ct.get("late_wall", 0.0) >= quiet:
+                        self.settle(ct, top_up=True)      # readings came after the settlement: the sellers are owed for them
+                except Exception as exc:                  # noqa: BLE001
+                    self.event("settle_error", event_id=(ct.get("need") or {}).get("event_id"), error=str(exc)[:200])
+                    log.exception("settling a contract")
 
     def tick_loop(self) -> None:
         while True:
@@ -571,23 +631,16 @@ class Utility:
                 self.event("tick_error", error=str(exc)[:200])
             time.sleep(2)
 
-    def settle(self, ct: dict[str, Any]) -> str:
-        """DEG demand-flex settlement on the participating meters' own readings against the Ameren baselines."""
+    def settle(self, ct: dict[str, Any], top_up: bool = False) -> str:
+        """DEG demand-flex settlement on the participating meters' own readings against their baselines. `top_up`: settled again on readings
+        that came in after the first settlement. The whole result goes again, and the coordinator pays what it adds."""
         sender, txn = ct["settle_to"]
+        prior = float((ct.get("settlement") or {}).get("total") or 0.0)
         need = ct["need"]
-        meters: dict[str, dict[int, dict[str, float]]] = {}
-        bases = self.settlement_baselines(ct)
-        for home in ct.get("meters", []):
-            for sid, usage in ct.get("meter_readings", {}).get(home, {}).items():
-                base = bases.get(home, {}).get(str(sid), {}).get("BASELINE")
-                if base is not None and int(sid) not in (ct.get("abnormal") or {}).get(home, ()):
-                    meters.setdefault(home, {})[int(sid)] = {"BASELINE": base, "USAGE": usage}
-                    if st.MARKET:
-                        meters[home][int(sid)]["BATT"] = float(ct.get("meter_batt", {}).get(home, {}).get(sid, 0.0))
-                        meters[home][int(sid)]["BASELINE"] = st.adjusted(base, ct.get("meter_pre", {}).get(home), ct.get("pre_baselines", {}).get(home))
-        # a building node's meter counts at most 1.2x its commitment in each half hour (its signed readings say what
-        # it committed): its baseline picks days without its own routine evening cut (settlement.building_counted_kwh)
-        caps = {m: {int(k): st.BUILDING_CAP_X * float(v) for k, v in ct.get("meter_committed", {}).get(m, {}).items()}
+        meters, notes = mc.counted(ct, self.settlement_baselines(ct))
+        # a building node's meter counts at most 1.2x its commitment in each half hour (the coordinator's word for what it
+        # committed): its baseline picks days without its own routine evening cut (settlement.building_counted_kwh)
+        caps = {m: {int(k): st.BUILDING_CAP_X * mc.committed(ct, m, k) for k in ct.get("meter_committed", {}).get(m, {})}
                 for m in meters if (self.fleet.get(m) or {}).get("kind") == "building"}
         ct["capped"] = self._called_slots(ct) if st.MARKET else {}
         result = st.deg_settle(need["slots"], ct.get("offered", {}), meters, hours=beckn.SLOT_MINUTES / 60,
@@ -599,17 +652,26 @@ class Utility:
         if caps:
             result["caps_kw"] = {m: {str(k): round(v, 6) for k, v in c.items()} for m, c in caps.items()}   # the split reads these
             result["cap_rule"] = f"a building's meter counts at most {st.BUILDING_CAP_X:g} x its commitment per half hour"
+        refused = {h: {str(k): v for k, v in d.items()} for h, d in (ct.get("rejected_slots") or {}).items() if d}
+        checks = {**notes, **({"refused": refused} if refused else {}), **({"pre_refused": ct["pre_refused"]} if ct.get("pre_refused") else {})}
+        if checks:                                        # never silent: on the settlement, on the record and in the log
+            result["meter_checks"] = checks
+            self.event("readings_checked", event_id=need["event_id"], **{k: (len(v) if hasattr(v, "__len__") else v) for k, v in checks.items()})
         ct["settlement"] = result
         ct["status"] = "COMPLETE"
+        ct["late_readings"] = 0
+        ct["top_ups"] = ct.get("top_ups", 0) + (1 if top_up else 0)
         bad = ct.get("rejected_readings", 0)
         actuals = {h: {str(k): v for k, v in d.items()} for h, d in meters.items()}
         self.reply(sender, "on_status", txn, {"contract": {"id": ct["contract"]["id"]},
-                                              "performance": {"kind": "actuals", "meters": actuals}})
+                                              "performance": {"kind": "actuals", "meters": actuals}}, "actuals", ct["top_ups"])
         # the actuals travel inside the settlement too, so the split never depends on which message arrives first
-        self.reply(sender, "on_status", txn, {"contract": {"id": ct["contract"]["id"], "status": "COMPLETE"},
-                                              "settlement": {**result, "currency": need["currency"],
-                                                             "rejected_readings": bad, "actuals": actuals}})
-        self.event("settled", event_id=need["event_id"], seller_usd=result["total"], meters=len(meters), bad=bad)
+        ct["settled_msg"] = {"contract": {"id": ct["contract"]["id"], "status": "COMPLETE"},
+                             "settlement": {**result, "currency": need["currency"], "rejected_readings": bad, "actuals": actuals, "lacking": self._lacking(ct),
+                                            **({"top_up": ct["top_ups"], "prior_total": prior} if top_up else {})}}
+        self.reply(sender, "on_status", txn, ct["settled_msg"], "settled", ct["top_ups"])
+        self.event("settle_top_up" if top_up else "settled", event_id=need["event_id"], seller_usd=result["total"], prior_usd=prior, meters=len(meters), bad=bad)
+        self.watch.settle_again_for(ct)                   # a call settled first was measured against fewer of these readings
         return f"settled {result['total']} {need['currency']}"
 
     def _called_slots(self, ct: dict[str, Any]) -> dict[int, float]:
@@ -619,7 +681,7 @@ class Utility:
         out = {int(k): float(sold.get(int(k), 0.0)) for k in ct.get("called_slots") or []}
         for s in ct["need"]["slots"]:
             end = beckn.add_minutes(s["start"], beckn.SLOT_MINUTES)
-            if any(c["start"] < end and s["start"] < c["end"] and c.get("status") != "REFUSED" for c in self.watch.calls.values()):
+            if any(c["start"] < end and s["start"] < c["end"] and c.get("status") != "REFUSED" and c.get("confirmed_kw") is not None for c in self.watch.calls.values()):   # a call the desk never heard of cuts nothing
                 out[int(s["id"])] = float(sold.get(int(s["id"]), 0.0))
         return out
 
@@ -640,17 +702,18 @@ class Utility:
         with self.lock:
             try:
                 note = self.handle(msg.get("kind", ""), msg.get("from"), msg.get("body") or {})
-                status = "processed"
             except Exception as exc:
-                note, status = f"error: {exc}", "rejected"
+                note = beckn.Refused(f"error: {exc}")
                 log.exception("handle")
-        self.town.ack(msg["message_id"], msg["fence"], status, {"note": str(note)[:300]})
+        if self.keeper is not None and not keep.from_a_node(msg):
+            self.keeper.save()                            # on disk before Town hears it: nobody sends a contract step twice
+        self.town.ack(msg["message_id"], msg["fence"], *beckn.ack_of(note, 300))
 
 
 def build_app(u: Utility):
     from fastapi import Body, FastAPI, HTTPException
 
-    app = FastAPI(title="flexgrid-utility", version="0.2.0")
+    app = FastAPI(title="flexgrid-utility", version="0.2.0", dependencies=[doors.door()])
 
     @app.get("/health")
     def health():
@@ -658,12 +721,12 @@ def build_app(u: Utility):
         lag = getattr(u, "lag", None)
         return {"ok": True, "agent": u.name, "pubkey": u.pub, "now": u.now(), "contracts": len(u.contracts),
                 "label": "Utility or ENGIE (mock, public data)", "town_calls": p.stats() if p else None,
-                "inbox_lag_s": round(lag.value(), 1) if lag else 0.0,
-                "town_ms": u.town.timing() if getattr(u, "town", None) is not None and hasattr(u.town, "timing") else None}
+                "inbox_lag_s": round(lag.value(), 1) if lag else 0.0, "doors": doors.state(),
+                "town_ms": u.town.timing() if getattr(u, "town", None) is not None and hasattr(u.town, "timing") else None, **keep.health(u.keeper)}
 
     @app.get("/contracts")
     def contracts():
-        return {t: {**{k: v for k, v in c.items() if k in ("status", "meters", "offered", "settlement", "buyer_review")},
+        return {t: {**{k: v for k, v in c.items() if k in ("status", "meters", "offered", "settlement", "buyer_review", "rejected_readings", "rejected_slots", "pre_refused")},
                     "event_id": c.get("need", {}).get("event_id")}
                 for t, c in u.contracts.items()}
 
@@ -686,7 +749,7 @@ def build_app(u: Utility):
 
     @app.get("/forecast/{day}")
     def forecast(day: str):
-        """The community's demand tomorrow by hour (10/50/90 %), from the trained community model on the meters' history:
+        """The community's demand tomorrow by hour (10/50/90 %), from the meters' own history and the issued weather forecast:
         what the buyer's desk reads before it orders (MCP tool forecast_community_demand)."""
         from . import community_forecast
         try:
@@ -739,9 +802,10 @@ def build_app(u: Utility):
             raise HTTPException(400, "kw (or pct) and minutes must be numbers")
         if not (0 < kw <= 2000 and 15 <= minutes <= 240):
             raise HTTPException(400, "kw must be in (0, 2000] and minutes in [15, 240]")
-        with u.lock:
-            a = u.watch.alert(kw, minutes, str(body.get("why") or "grid emergency")[:120])
-            u.watch.tick()
+        with u.lock:                                     # "at": a step a test runner names, for an alert told at that step
+            a = u.watch.alert(kw, minutes, str(body.get("why") or "grid emergency")[:120], at=body.get("at") or None)
+            if a["at"] <= u.now():
+                u.watch.tick()
             return a
 
     @app.post("/demo/price")
@@ -773,20 +837,26 @@ def build_app(u: Utility):
         agent is about to order again for the same day)."""
         with u.lock:
             u.contracts.clear()
+            u.unsent.clear()
             u.traffic_homes.clear()
             u.run_wall = time.time()
+            u.play = ids.new_play()
             from .rt_buyer import GridWatch
             from . import replay as replay_mod
-            u.watch = GridWatch(u)
+            u.watch, u.watch.price_rule = GridWatch(u), u.watch.price_rule   # a stand-in buyer stays one that calls only on an alert
             replay_mod.set_price(None)
             u.orders = {} if (body or {}).get("clear_orders") else \
                 {k: v for k, v in u.orders.items() if not str(v.get("buyer", "")).startswith("Control Room")}
         return {"ok": True}
 
+    @app.get("/demo/clock")
+    def demo_clock_get():
+        return u.clock.clock()
+
     @app.post("/demo/clock")
     def demo_clock(body: dict = Body(default={})):
         u.clock.configure(body.get("start", u.clock.start), float(body.get("step_seconds", u.clock.step_seconds)),
-                          int(body.get("loop_days", u.clock.loop_days)), body.get("at"), body.get("at_wall"))
+                          int(body.get("loop_days", u.clock.loop_days)), body.get("at"), body.get("at_wall"), hold=bool(body.get("hold")))
         return u.clock.clock()
 
     return app
@@ -807,10 +877,14 @@ def main() -> None:
     logs = __import__("pathlib").Path(__file__).resolve().parents[1] / "logs"
     logs.mkdir(exist_ok=True)
     wire.open_log(str(logs / "town_wire_utility.jsonl"))       # every reading a home sends the utility (live_talk)
+    keeper = keep.for_buyer(u)                                 # a contract that was running carries on
     u.town.join_until_up(then=lambda: threading.Thread(target=u.inbox_loop, daemon=True).start(),
                          log=lambda m: (print(m, flush=True), u.event("town_error", error=m)))
     threading.Thread(target=u.tick_loop, daemon=True).start()
-    uvicorn.run(build_app(u), host="127.0.0.1", port=int(u.cfg.get("utility_port", 7873)), log_level="warning")
+    try:
+        uvicorn.run(build_app(u), host="127.0.0.1", port=int(u.cfg.get("utility_port", 7873)), log_level="warning")
+    finally:
+        keeper.close()
 
 
 if __name__ == "__main__":

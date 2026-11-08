@@ -43,21 +43,28 @@ def iso_now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def iso_of(wall: float) -> str:
+    return datetime.fromtimestamp(wall, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 def make(action: str, *, sender: str, receiver: str, transaction_id: str, message: dict[str, Any], key,
-         sender_role: str = "bap", message_id: str | None = None, ttl_s: float | None = None) -> dict[str, Any]:
+         sender_role: str = "bap", message_id: str | None = None, ttl_s: float | None = None, wall: float | None = None) -> dict[str, Any]:
     """Build and sign one Beckn v2 message. `sender_role` says which context slot the sender fills. `ttl_s`: how long
     the message stays valid (context.ttl); TTL_S for a request or an answer that only matters while the market is
     deciding, TTL_EVIDENCE_S for a statement of fact (a signed meter reading, a settlement, a payment), which stays
     true however late it arrives.
     The message is put through JSON first, so what is signed is exactly what arrives over NANDA Town (an int dict key
     becomes a string there and sorts differently in the canonical form; signing the Python object would break the
-    signature for 11+ slots) and so the in-memory simulation sees what the live agents see."""
+    signature for 11+ slots) and so the in-memory simulation sees what the live agents see.
+    An answer that has to come out the same byte for byte however often it's made, with no memory of the last time (ids.py), passes its `message_id` and `wall`, the time it
+    carries: 0.0 is undated, and never expires."""
     message = json.loads(json.dumps(message))
     bap, bpp = (sender, receiver) if sender_role == "bap" else (receiver, sender)
+    made = time.time() if wall is None else wall
     body = {"context": {"networkId": NETWORK, "version": VERSION, "domain": DOMAIN, "action": action,
                         "bapId": bap, "bppId": bpp, "transactionId": transaction_id,
-                        "messageId": message_id or str(uuid.uuid4()), "timestamp": iso_now(),
-                        "ttl": f"PT{int(ttl_s if ttl_s is not None else TTL_S)}S", "sentWall": time.time()},
+                        "messageId": message_id or str(uuid.uuid4()), "timestamp": iso_now() if wall is None else iso_of(wall),
+                        "ttl": f"PT{int(ttl_s if ttl_s is not None else TTL_S)}S", "sentWall": made},
             "message": message}
     return signing.sign(body, key)
 
@@ -83,10 +90,47 @@ def expired(body: dict[str, Any], now_wall: float | None = None, default_ttl: fl
     waited in a Town inbox while its receiver was off is answered too late to matter: the receiver drops it."""
     ctx = body.get("context") or {}
     sent = ctx.get("sentWall")
-    if not isinstance(sent, (int, float)):
+    if not isinstance(sent, (int, float)) or sent <= 0:
         return None
     late = (now_wall if now_wall is not None else time.time()) - sent - ttl_seconds(ctx.get("ttl"), default_ttl)
     return late if late > 0 else None
+
+
+class Refused(str):
+    """What a receiver answers about a message it did not act on: a bad signature, a sender it doesn't know, past its time, or nothing it can do with it. It reads like any other
+    answer, and ack_of acknowledges it as `rejected`.
+
+    Why it isn't just text: Town's record is the evidence, and `processed` there says the work was done. Every handler used to return such a line and then acknowledge `processed`,
+    so a forged message looked like work done. What Town does with each status (nandatown db.ack):
+      processed, received, rejected, failed   the message is done: it's never handed out again, and the inbox goes on, so a true rejection can't come back for ever or stop a run
+      retryable                               back in the inbox at once. Nothing here uses it: a message that can't be read would come back for ever
+    Town's evaluator reads only the quote messages' acks, and counts `rejected` as settled custody, so a run with rejections in it still ends. A repeat of something already done is
+    not a rejection: it stays `processed` (a settlement, a payment or an answer delivered twice)."""
+
+
+class Partly(str):
+    """An envelope of readings where some counted and some didn't. The envelope was processed, and the note says how many were refused."""
+    refused = 0
+
+    def __new__(cls, text: str, refused: int):
+        self = super().__new__(cls, text)
+        self.refused = refused
+        return self
+
+
+def of_batch(parts: list[str]) -> str:
+    """One answer for one envelope: rejected only if nothing in it counted."""
+    text = "; ".join(parts)[:300]
+    bad = sum(isinstance(p, Refused) for p in parts)
+    return Refused(text) if parts and bad == len(parts) else Partly(text, bad) if bad else text
+
+
+def ack_of(note: Any, limit: int = 200, field: str = "note") -> tuple[str, dict[str, Any]]:
+    """What goes to Town for this handler's answer: the status and the note."""
+    out: dict[str, Any] = {field: str(note)[:limit]}
+    if isinstance(note, Partly):
+        out["refused"] = note.refused
+    return ("rejected" if isinstance(note, Refused) else "processed"), out
 
 
 def kind(action: str) -> str:

@@ -21,6 +21,8 @@ from typing import Any, Callable, Iterable
 
 import httpx
 
+from . import arm
+
 COMPARE = ("clean", "policy", "answer", "command")
 
 
@@ -73,8 +75,11 @@ class Log:
         for x in lines:
             if x.strip():
                 try:
-                    rows.append(json.loads(x))
-                except ValueError:
+                    r = json.loads(x)
+                    if not isinstance(r, dict) or not {"kind", "hash"} <= set(r):
+                        raise ValueError("not a row")
+                    rows.append(r)
+                except (ValueError, RecursionError):
                     rows.append({"n": len(rows) + 1, "kind": "unreadable", "node": self.node, "text": x[:200].decode("utf-8", "replace"), "hash": ""})
         if tail.strip():
             with path.with_name(path.name + ".torn").open("ab") as f:
@@ -187,9 +192,12 @@ class RecordingBrain:
         self.version = model or {"name": getattr(inner, "model", ""), "digest": ""}
 
     def __getattr__(self, name: str) -> Any:
+        if name == "inner":                       # copy.copy asks a new, empty one for __setstate__, and with no inner this would ask itself until the stack ran out: every note on a loan died of that
+            raise AttributeError(name)
         return getattr(self.inner, name)
 
     def ask(self, system: str, tools: list[dict[str, Any]], text: str, **kw: Any) -> dict[str, Any]:
+        system = arm.shorten(system)              # a speed-up the run may ask for (node/arm.py): logged as sent
         a = self.inner.ask(system, tools, text, **kw)
         self.log.add("model", asked=sha(system, tools, text), prompt=self.prompt, model=self.version, options=self.options, system=system, text=text, tools=tools, answer=a)
         return a
@@ -228,6 +236,7 @@ class RecordingBackend:
         self.inner, self.log = inner, log
 
     def decide(self, role: str, system: str, facts: dict[str, Any], schema: dict[str, Any], *, budget_s: float = 40.0, session: str | None = None):
+        system = arm.shorten(system)
         ans, meta = self.inner.decide(role, system, facts, schema, budget_s=budget_s, session=session)
         self.log.add("decide", asked=sha(system, facts, schema), role=role, session=session, facts=facts, answer=ans, meta=meta)
         return ans, meta

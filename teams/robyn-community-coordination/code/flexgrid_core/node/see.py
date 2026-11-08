@@ -10,6 +10,7 @@ from typing import Any
 
 from . import tools as T
 from ..adapters.simulated import DONE_BY
+from ..rt_control import person_limit
 
 COLD_F = 40.0                        # at or below this, the pool pump's freeze protection comes first
 POOL_SPEED, POOL_FLOOR = 60, 33      # percent: the running speed and the lowest filter speed
@@ -47,6 +48,7 @@ def see_home(sim: Any, ts: str, sale: dict[str, Any] | None, shelf: list[str]) -
     hours = max(0.25, rp.minutes_between(t0, end) / 60.0) if sale else 0.25
     lev = sim.levers or {}
     dev: dict[str, dict[str, Any]] = {}
+    lowered: dict[str, str] = {}             # tool -> what a person lowered, in words: the prompt, the tool cards and the site status all say it
 
     if "set_battery" in shelf and sim.E > 0:
         stored = max(0.0, sim.soc - sim.R) * sim.E
@@ -100,16 +102,20 @@ def see_home(sim: Any, ts: str, sale: dict[str, Any] | None, shelf: list[str]) -
         run = sum(a[0] for a in at) / len(at)
         cop = sum(a[1] for a in at) / len(at)
         occ = any(a[3] for a in at)                               # anyone home at any point in the window: a house warmed for an empty home was over the limit when they came back
-        lim = sim.ctl.limits
-        limit_c = round(lim.max_rise_c if occ else lim.max_rise_away_c, 2)
+        key = "max_rise_c" if occ else "max_rise_away_c"
+        said = person_limit(sim, key)
+        limit_c = round(said, 2)
+        if said < getattr(sim.ctl.limits, key):
+            lowered[tool] = f"The owner's limit is {limit_c:.2f} C now, not {getattr(sim.ctl.limits, key):.2f}."
         share = min(1.0, limit_c * h.cap / max(1e-6, run * cop * hours))
         dev["cool"] = {"tool": tool, "target": "main-thermostat" if tool == "set_thermostat" else "all-room-acs",
                        "mode": "cooling" if h.sign(t0) > 0 else "heating", "running": run > 0.02, "run_kw": round(run, 3), "cop": round(cop, 2),
                        "can_give_kw": floor2(run * share), "limit_c": limit_c, "cap": h.cap, "hours": hours}
 
+    left_out = sim.dev_off | sim.kept_out                         # the offer left these out, or a person did: the controller won't touch them, so a call would give nothing
     if "set_water_heater" in shelf and "hpwh" in sim.app:
-        give = floor2(window_mean(sim, "hpwh", start, end)) if sale else 0.0
-        dev["water"] = {"tool": "set_water_heater", "target": "water-heater", "can_give_kw": give, "valve": True, "tank_f": 128, "normal_f": 128, "hot_ok": True}
+        give = floor2(window_mean(sim, "hpwh", start, end)) if sale and "hpwh" not in left_out else 0.0
+        dev["water"] = {"tool": "set_water_heater", "target": "water-heater", "can_give_kw": give, "valve": True, "tank_f": 128, "normal_f": 128, "hot_ok": True, "left_out": "hpwh" in left_out}
 
     if "delay_appliance" in shelf:
         j = rp.idx_of(t0)
@@ -125,14 +131,14 @@ def see_home(sim: Any, ts: str, sale: dict[str, Any] | None, shelf: list[str]) -
     if "set_pool_pump" in shelf and "pool" in sim.app:
         kw = window_mean(sim, "pool", start, end) if sale else 0.0
         air_f = float(row.get("temp_c", 20.0)) * 9 / 5 + 32
-        dev["pool"] = {"tool": "set_pool_pump", "target": "pool-pump", "can_give_kw": floor2(kw * (1 - (POOL_FLOOR / POOL_SPEED) ** POOL_EXP)), "run_kw": round(kw, 3),
-                       "running": kw > 0.02, "speed": POOL_SPEED, "floor": POOL_FLOOR, "air_f": round(air_f), "cold": air_f <= COLD_F, "filter_ok": True}
+        dev["pool"] = {"tool": "set_pool_pump", "target": "pool-pump", "can_give_kw": 0.0 if "pool" in left_out else floor2(kw * (1 - (POOL_FLOOR / POOL_SPEED) ** POOL_EXP)), "run_kw": round(kw, 3),
+                       "running": kw > 0.02, "speed": POOL_SPEED, "floor": POOL_FLOOR, "air_f": round(air_f), "cold": air_f <= COLD_F, "filter_ok": True, "left_out": "pool" in left_out}
 
     temp = float(row.get("temp_c", 20.0))
     wk = "weekend" if rp.row(i)["ts_local"][:10] and _weekend(ts) else "weekday"
     label = ("Hot " if temp >= 27 else "Cold " if temp <= 5 else "Mild ") + wk
     return {"node": getattr(sim, "cfg", {}).get("name"), "side": "home", "ts": ts, "now": hhmm(ts), "sale": sale, "owed_kw": 0.0 if not sale else float(sale["owed_kw"]),
-            "day": label, "alarm": sim.overrides.get("alarm"), "devices": dev, "shelf": list(shelf)}
+            "day": label, "alarm": sim.overrides.get("alarm"), "stopped": bool(sim.overrides.get("stop")), "devices": dev, "shelf": list(shelf), "lowered": lowered}
 
 
 def _weekend(ts: str) -> bool:
@@ -182,6 +188,7 @@ def render(f: dict[str, Any], owed: float, done: list[str], why: str | None, blo
     out.append(f"This home still owes {owed:.1f} kW." if owed > 0.05 else "0 kW are owed.")
     if why:
         out.append(f"What changed: {why}")
+    out += list((f.get("lowered") or {}).values())
     out += done
     rank = sorted(f["devices"].items(), key=lambda kv: -kv[1].get("can_give_kw", 0.0))
     for k, d in rank:

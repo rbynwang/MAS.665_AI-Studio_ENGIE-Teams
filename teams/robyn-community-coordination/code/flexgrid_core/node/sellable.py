@@ -23,6 +23,7 @@ import numpy as np
 
 from .. import config
 from ..home_features import cop as heat_per_kw
+from ..rt_control import person_limit
 from .see import POOL_EXP, POOL_FLOOR, POOL_SPEED
 
 V2H_MAX_KW = 9.6                 # the two-way kit's rating, as see_home uses it
@@ -111,9 +112,8 @@ def _cooling(sim: Any, d: dict[str, Any], idx: list[int], hours: float, live: bo
         return None
     ts = [sim.replay.ts(i) for i in idx]
     cop = heat_per_kw([float(sim.replay.rows[i].get("fc_temp_c", 20.0)) for i in idx], int(ts[0][5:7]) in (5, 6, 7, 8, 9))
-    lim = sim.ctl.limits
     occ = float(_on(d, idx, d["plan"]["plan_occ"]).mean()) >= .5
-    limit_c = (lim.max_rise_c if occ else lim.max_rise_away_c) + (0.0 if live else lim.precool_c)    # the day before, there is time to pre-cool
+    limit_c = person_limit(sim, "max_rise_c" if occ else "max_rise_away_c") + (0.0 if live else person_limit(sim, "precool_c"))    # the day before, there is time to pre-cool
     out = []
     for q in (d["drift"][0], d["drift_mean"], d["drift"][2]):
         c = _on(d, idx, q)
@@ -226,7 +226,7 @@ def overlay(facts: dict[str, Any], sim: Any, fc: Any) -> dict[str, Any]:
     floor2 = lambda x: float(np.floor(x * 100 + 1e-9) / 100)     # noqa: E731
     dev = facts["devices"]
     for k, d in dev.items():
-        if k in give and (k not in TAKES_CALL or d["status"] == TAKES_CALL[k]):    # a car that can't take this call keeps see_home's number, whatever tonight's forecast says
+        if k in give and not d.get("left_out") and (k not in TAKES_CALL or d["status"] == TAKES_CALL[k]):    # a car that can't take this call keeps see_home's number, whatever tonight's forecast says
             d["can_give_kw"] = floor2(give[k])
     if "car" in dev and "car_max_kwh" in give and dev["car"]["status"] == TAKES_CALL["car"]:    # see_home's room leaves out a waiting car's own session
         dev["car"]["max_kwh"] = floor2(give["car_max_kwh"])

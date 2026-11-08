@@ -31,14 +31,13 @@ from __future__ import annotations
 import random
 import threading
 import time
-import uuid
 from collections import deque
 from concurrent.futures import Future
 from typing import Any, Callable
 
-from . import beckn, signing, telemetry as tcheck
+from . import beckn, ids, signing, telemetry as tcheck
 from .forecaster import HomeForecaster, HomeForecaster2026
-from .node import sellable
+from .node import grounds, sellable
 
 SLOT = beckn.SLOT_MINUTES
 POST_STEPS = 32                     # the evening after the window that offers forecast (8 h)
@@ -70,9 +69,11 @@ class HomeV2:
         if self.is_building:                  # the homes' trained models are for homes: a building forecasts its load
             self.cfg = {**cfg, "forecast": "temp_regression", "building_forecast": cfg.get("forecast")}   # on its own record (hour-of-day line, weather), or its own trained models
         self.offers: dict[str, dict[str, Any]] = {}          # event_id -> offer we made
+        self.before_note: dict[str, dict[str, Any]] = {}     # event_id -> the safe offer before a person's note kept part of it out
         self.contracts: dict[str, dict[str, Any]] = {}       # contract_id -> contract + our status
         self.payments: list[dict[str, Any]] = []             # one per event_id (a repeated payment notice is ignored)
         self.reputation = float(cfg.get("reputation", 1.0))
+        self.play = ids.new_play()                           # this play of the day, in every id it sends (ids.py): new at each reset, kept through a restart
         self.history: deque = deque(maxlen=8)
         self._fits: dict[tuple, tuple[float, float] | None] = {}
         self._fc_now: int | None = None
@@ -122,7 +123,11 @@ class HomeV2:
 
     def reset(self) -> None:
         """Forget offers, contracts and plans (demo: replay the same day again)."""
-        self.offers.clear(); self.contracts.clear(); self.payments.clear()
+        self.offers.clear(); self.contracts.clear(); self.payments.clear(); self.before_note.clear()
+        self.play = ids.new_play()
+        self.reputation = float(self.cfg.get("reputation", 1.0))   # a run's marks are that run's: lost messages on 2 Jul shrank 14 Jul's sale by 27 %
+        if hasattr(self.adapter, "recent"):
+            self.adapter.recent.clear()                     # last run's meter rows: a run must read only its own
         if self.brain is not None:
             self.brain.reset()
         if hasattr(self.adapter, "plan"):
@@ -130,7 +135,9 @@ class HomeV2:
             self.adapter.ev_holds.clear()
         if hasattr(self.adapter, "rt_reset"):
             self.adapter.rt_reset()
+        self.history.clear()                                # the sensors' check compares readings: last run's mustn't read as a jump in this one
         self._rt_reported, self._rt_at, self._rt_why = {}, None, None
+        self._rt_fc, self._fc_now = {"hour": None, "vals": {}}, None
 
     # ------------------------------------------------------------------ helpers
     def now_idx(self) -> int:
@@ -351,6 +358,8 @@ class HomeV2:
         no event (EV on, battery default)  vs  EV paused  vs  EV paused + battery discharging extra.
         EV part of the offer = what pausing the EV really saves at the meter (less than the EV's kW when the battery
         would have covered part of the EV anyway); battery part = what the extra discharge saves on top."""
+        if self.agent is not None:                                   # what a person wrote comes first: the offer follows what the model reads in it
+            self.agent.read_note(self.now_ts())
         lim = self.adapter.limits()
         P, E, R, SM, eta = lim["battery_kw"], lim["battery_kwh"], lim["reserve_pct"] / 100, lim["soc_max_pct"] / 100, lim["eta"]
         usable = (SM - R) * E * eta                                   # kWh between reserve and full, AC side
@@ -469,8 +478,12 @@ class HomeV2:
             offer["weather"] = w             # declared so that the independent check's replay runs under it too
         if P <= 0 and E > 0:                 # a battery out of service (its inverter tripped): declared the same way
             offer["battery"]["out_of_service"] = True
-        if self.agent is not None:
-            self.agent.market("5 offer", self.now_ts())
+        if self.agent is not None:                                   # at a node with no agent of its own a loan's wish holds here too (node/loans.py)
+            kept = grounds.keep_out(offer, self.agent.guard.wishes, need)
+            if kept is not offer:
+                self.before_note[need["event_id"]] = offer           # the offer without the note: what a rule would make, since it can't read one (brain.offer_receipt)
+            offer = kept
+            self.agent.market("5 offer", self.now_ts(), need=need, offer=offer)
         if self.brain is not None:                                   # the AI agent decides how much of it to offer
             try:                                                     # (it falls back to the plan by itself; should it
                 offer = self.brain.decide_offer(need, fc, offer)     # raise anyway, the plan's offer goes out)
@@ -479,10 +492,41 @@ class HomeV2:
         self.offers[need["event_id"]] = offer
         return offer
 
-    def send_offer(self, txn: str, offer: dict[str, Any]) -> dict[str, Any]:
+    def tag_offer(self, offer: dict[str, Any]) -> dict[str, Any]:
+        return offer
+
+    def mid(self, to: str, kind: str, *key: Any, asked: str | None = None) -> str:
+        """The id of one of this node's messages. `asked`: what it answers (ids.asked), which takes the place of the play tag. A message of its own goes under its play."""
+        return ids.sealed(None if asked else self.key, asked or self.play, self.name, to, kind, *key)
+
+    def answer_more(self, txn: str, need: dict[str, Any], more: dict[str, Any], asked: str | None = None) -> str:
+        """The second round of a sale: this node held part of its safe offer back and the pool is short. Its agent proposes again and its code clamps (brain.raise_offer). The
+        answer goes either way, so the clearing doesn't wait for it."""
+        eid = need["event_id"]
+        offer = self.offers.get(eid)
+        if offer is None:
+            return beckn.Refused(f"no offer for {eid}")
+        if self.brain is not None and hasattr(self.brain, "raise_offer"):
+            try:
+                offer = self.offers[eid] = self.tag_offer(self.brain.raise_offer(need, more, offer))
+            except Exception as exc:                             # the first offer stands
+                self.log("agent_error", where="raise_offer", error=f"{type(exc).__name__}: {str(exc)[:200]}")
+        return self.send_offer(txn, offer, asked)["summary"]
+
+    @staticmethod
+    def wire_offer(offer: dict[str, Any]) -> dict[str, Any]:
+        """With every node an agent the coordinator hears only the amount: the kW per half hour, and which decision it was. The agent's reason, the person's own
+        words and the receipt stay on the node (node/agent.py receipt), and the person hears the reason on their own channel."""
+        from .node.arm import all_agents
+        a = offer.get("agent")
+        if not all_agents() or not isinstance(a, dict):
+            return offer
+        return {**offer, "agent": {k: a[k] for k in ("decided_by", "decision", "round") if k in a}}
+
+    def send_offer(self, txn: str, offer: dict[str, Any], asked: str | None = None) -> dict[str, Any]:
         body = beckn.make("on_discover", sender=self.name, receiver=self.coordinator, transaction_id=txn,
-                          message={"offer": offer}, key=self.key, sender_role="bpp")
-        out = self.send(self.coordinator, beckn.kind("on_discover"), body, f"{self.name}:offer:{offer['event_id']}:{uuid.uuid4().hex[:6]}")
+                          message={"offer": self.wire_offer(offer)}, key=self.key, sender_role="bpp")
+        out = self.send(self.coordinator, beckn.kind("on_discover"), body, self.mid(self.coordinator, "on_discover", offer["event_id"], asked=asked))
         self.log("v2_offer_sent", event_id=offer["event_id"], kw=[s["kw_offered"] for s in offer["slots"]],
                  confidence=offer["confidence"])
         return {"sent": out, "summary": f"Offer for {offer['event_id']}: {[s['kw_offered'] for s in offer['slots']]} kW "
@@ -549,7 +593,7 @@ class HomeV2:
         self.contracts[cid] = {**c, "status": "ACCEPTED", "reported": [], "accepted_at": self.now_ts()}
         return {"installed": True, "steps": len(actions), "ev_hold": hold}
 
-    def answer(self, txn: str, c: dict[str, Any], verdict: dict[str, Any]) -> dict[str, Any]:
+    def answer(self, txn: str, c: dict[str, Any], verdict: dict[str, Any], asked: str | None = None) -> dict[str, Any]:
         prev = self.contracts.get(c.get("id")) if c.get("id") else None
         if prev and prev.get("status") in ("ACCEPTED", "DECLINED"):
             # an answer is final: a contract this home accepted (its plan is installed) is never turned into DECLINED,
@@ -561,7 +605,7 @@ class HomeV2:
                           message={"contract": {"id": c.get("id"), "event_id": c.get("event_id"), "home": self.name,
                                                 "status": verdict["decision"], "reason": verdict["reason"]}},
                           key=self.key, sender_role="bpp")
-        out = self.send(self.coordinator, beckn.kind("on_confirm"), body, f"{self.name}:answer:{c.get('id')}:{uuid.uuid4().hex[:6]}")
+        out = self.send(self.coordinator, beckn.kind("on_confirm"), body, self.mid(self.coordinator, "on_confirm", c.get("id"), asked=asked))
         self.log("v2_contract_" + verdict["decision"].lower(), contract_id=c.get("id"), reason=verdict["reason"])
         return {"sent": out, "summary": f"Contract {c.get('id')}: {verdict['decision']} ({verdict['reason']})."}
 
@@ -630,8 +674,7 @@ class HomeV2:
         body = beckn.make("on_status", sender=self.name, receiver=self.coordinator, transaction_id=txn,
                           message={"performance": reading}, key=self.key, sender_role="bpp",
                           ttl_s=beckn.TTL_EVIDENCE_S)
-        out = self.send(self.coordinator, beckn.kind("on_status"), body,
-                        f"{self.name}:reading:{reading['contract_id']}:{reading['slot_id']}:{uuid.uuid4().hex[:6]}")
+        out = self.send(self.coordinator, beckn.kind("on_status"), body, self.mid(self.coordinator, "on_status", reading["contract_id"], reading["slot_id"]))
         util = self.cfg.get("utility_name", "utility")
         uout = None
         if util:                     # the meter owner gets the reading straight from the home, signed by the home
@@ -639,8 +682,7 @@ class HomeV2:
             ubody = beckn.make("on_status", sender=self.name, receiver=util, transaction_id=txn,
                                message={"performance": meter}, key=self.key, sender_role="bpp",
                                ttl_s=beckn.TTL_EVIDENCE_S)
-            uout = self.send(util, beckn.kind("on_status"), ubody,
-                             f"{self.name}:meter:{reading['contract_id']}:{reading['slot_id']}:{uuid.uuid4().hex[:6]}")
+            uout = self.send(util, beckn.kind("on_status"), ubody, self.mid(util, "on_status", reading["contract_id"], reading["slot_id"]))
         self._mark_reported(reading["contract_id"], reading["slot_id"], [out, uout])
         return {"sent": out, "summary": f"Slot {reading['slot_id']} of {reading['event_id']}: committed "
                                         f"{reading['committed_kw']} kW, meter {reading['usage_kw']} kW used."}
@@ -681,7 +723,7 @@ class HomeV2:
         if sender != self.coordinator or body.get("signer") not in self.trusted() or \
                 not beckn.check(body, body.get("signer", "")):
             self.log("v2_rejected_message", message_kind=kind, sender=sender)
-            return "rejected: not from a trusted coordinator"
+            return beckn.Refused("rejected: not from a trusted coordinator")
         return None
 
     def repeat_answer(self, body: dict[str, Any]) -> str | None:
@@ -692,26 +734,35 @@ class HomeV2:
         prev = self.contracts.get(c.get("id"))
         if prev and prev.get("status") in ("ACCEPTED", "DECLINED"):
             v = {"decision": prev["status"], "reason": prev.get("reason", "within_offer"), "contract_id": c.get("id")}
-            return self.answer(txn, c, v)["summary"]
+            return self.answer(txn, c, v, ids.asked(body))["summary"]
         return None
 
     def handle(self, kind: str, sender: str, body: dict[str, Any]) -> str:
         act = beckn.action_of(kind)
         txn = body.get("context", {}).get("transactionId", "")
+        asked = ids.asked(body)
         late = beckn.expired(body, default_ttl=float(self.cfg.get("max_message_age_s", 900)))
         if late:                                            # e.g. a call for offers that waited while this home was
-            return f"expired {round(late)} s ago: not acted on"   # off: the coordinator has moved on
+            return beckn.Refused(f"expired {round(late)} s ago: not acted on")   # off: the coordinator has moved on
         rejected = self.gate(kind, sender, body)
         if rejected:
             return rejected
+        if act == "discover" and "more" in body["message"]["intent"]:
+            return self.answer_more(txn, body["message"]["intent"]["need"], body["message"]["intent"]["more"], asked)
         if act == "discover":
             need = body["message"]["intent"]["need"]
+            if need.get("event_id") in self.offers:         # asked again: its offer didn't arrive. The same offer goes, and its agent isn't asked twice
+                return self.send_offer(txn, self.offers[need["event_id"]], asked)["summary"]
             sl = need.get("slots") or []
             self.log("recv", what="call for offers", sender=sender, event=need.get("event_id"),
                      window=f"{need['window_start'][5:]}-{need['window_end'][11:]}", half_hours=len(sl),
                      kw_wanted=sl[0].get("kw_requested") if sl else None, price=sl[0].get("price") if sl else None)
             t0 = time.perf_counter()
+            if self.agent is not None:
+                self.agent.market("1 read schedule", self.now_ts(), need=need)
             fc = self.forecast_window(need)
+            if self.agent is not None:
+                self.agent.market("2 forecast", self.now_ts(), need=need, fc=fc)
             self._tool("forecast_window", f"event {need['window_start'][5:]}-{need['window_end'][11:]} ({len(sl)} half hours), "
                        f"as of {self.now_ts()[5:]}", self._fc_words(fc), t0)
             t0 = time.perf_counter()
@@ -722,7 +773,7 @@ class HomeV2:
                        + f", reserve {lim['reserve_pct']:.0f} %" + (f"; EV charger {lim['ev_max_kw']:g} kW" if lim.get("ev_max_kw") else ""),
                        " · ".join(f"{x['kw_offered']:g}" for x in offer["slots"]) + f" kW per half hour = {offer['energy_kwh']} kWh, "
                        f"confidence {offer['confidence']}", t0)
-            return self.send_offer(txn, offer)["summary"]
+            return self.send_offer(txn, offer, asked)["summary"]
         if act == "confirm":
             again = self.repeat_answer(body)
             if again is not None:
@@ -733,7 +784,7 @@ class HomeV2:
             self._tool("check_commitment", "share " + " · ".join(f"{x['kw']:g}" for x in c.get("commitments", [])) + " kW, "
                        f"opt out by {str(c.get('opt_out_by', ''))[5:]}", f"{v['decision']} ({v['reason']})", t0)
             self.install_plan(c, v)
-            return self.answer(txn, c, v)["summary"]
+            return self.answer(txn, c, v, asked)["summary"]
         if act == "cancel":                                 # the coordinator froze the deal without this home's late yes
             cid = (body["message"].get("contract") or {}).get("id")
             c = self.contracts.get(cid)
@@ -752,21 +803,21 @@ class HomeV2:
             self.log("v2_event_notice", **{k: v for k, v in body["message"].items() if k != "contract"})
             return "event notice noted"
         if act == "rt_ask":                                 # the coordinator asks, during the day: how much more?
-            return self.rt_answer(txn, body["message"]["ask"])
+            return self.rt_answer(txn, body["message"]["ask"], asked)
         if act == "rt_dispatch":                            # what this home owes on top of its booking
             return self.rt_take(txn, body["message"]["dispatch"])
         if act == "on_status" and "settlement" in body["message"]:
             st = body["message"]["settlement"]
-            if any(p.get("event_id") == st.get("event_id") for p in self.payments):
+            if any(p.get("event_id") == st.get("event_id") and p.get("top_up") == st.get("top_up") for p in self.payments):
                 return f"payment for {st.get('event_id')} already noted"      # at-least-once delivery: count it once
             self.payments.append(st)
             self.reputation = float(st.get("reputation", self.reputation))
             self.log("v2_paid", event_id=st.get("event_id"), usd=st.get("payment"), delivered_kwh=st.get("delivered_kwh"))
             return f"payment noted: {st.get('payment')}"
-        return f"ignored {kind}"
+        return beckn.Refused(f"ignored {kind}")
 
     # ------------------------------------------------------------------ the real-time design (rt_market.py)
-    def rt_answer(self, txn: str, ask: dict[str, Any]) -> str:
+    def rt_answer(self, txn: str, ask: dict[str, Any], asked: str | None = None) -> str:
         if getattr(self.adapter, "mode", "fixed") == "rolling":
             cap = self.agent.could_give(ask["start"], ask["end"]) if self.agent is not None else self.adapter.rt_capacity(ask["start"], ask["end"])
         else:
@@ -777,7 +828,7 @@ class HomeV2:
         body = beckn.make("rt_answer", sender=self.name, receiver=self.coordinator, transaction_id=txn,
                           message={"answer": {"id": ask["id"], "kw": round(kw, 3), "why": cap.get("why")}},
                           key=self.key, sender_role="bpp")
-        self.send(self.coordinator, beckn.kind("rt_answer"), body, f"{self.name}:rt_answer:{ask['id']}:{uuid.uuid4().hex[:6]}")
+        self.send(self.coordinator, beckn.kind("rt_answer"), body, self.mid(self.coordinator, "rt_answer", ask["id"], asked=asked))
         self.log("rt_answer", call_id=ask["id"], kw=round(kw, 3), why=cap.get("why"))
         return f"can add {kw:.2f} kW for {ask['id']}"
 
@@ -863,10 +914,9 @@ class HomeV2:
         last = getattr(self, "_rt_at", None)
         if not urgent and last and self.replay.minutes_between(last, now) < self.REPORT_EVERY_MIN:
             return
-        body = beckn.make("rt_capacity", sender=self.name, receiver=self.coordinator, transaction_id=f"cap-{self.name}",
-                          message={"short": {t: round(v, 3) for t, v in short.items()}, "reason": why},
-                          key=self.key, sender_role="bpp")
-        self.send(self.coordinator, beckn.kind("rt_capacity"), body, f"{self.name}:rt_capacity:{uuid.uuid4().hex[:6]}")
+        msg = {"short": {t: round(v, 3) for t, v in short.items()}, "reason": why}
+        body = beckn.make("rt_capacity", sender=self.name, receiver=self.coordinator, transaction_id=f"cap-{self.name}", message=msg, key=self.key, sender_role="bpp")
+        self.send(self.coordinator, beckn.kind("rt_capacity"), body, self.mid(self.coordinator, "rt_capacity", now, ids.digest(msg)))
         self._rt_reported, self._rt_at, self._rt_why = short, now, why
         self.log("rt_capacity", short_kw=round(max(short.values(), default=0.0), 3), steps=len(short), reason=why)
 
@@ -878,12 +928,19 @@ class HomeV2:
             return "the owner needs the car now"
         if self.adapter.P <= 0 < self.adapter.E:
             return "its battery tripped"
-        if ov.get("comfort"):
+        said = getattr(getattr(self, "agent", None), "short_reason", None)    # what its agent reported stands until the sale ends
+        if said:
+            return said
+        if ov.get("comfort_limit") and getattr(self.adapter, "levers", None) is None:     # a person's word lives here. "comfort" is the slot the plan reads, and the agent writes it too, with levers open (37 of 85 gaps on arm D said an owner had) and in a building's pre-cool with them closed
             return "the owner changed the comfort limit"
         return "the forecast changed"
 
     def tick(self) -> list[str]:
         self.observe()
+        for c in getattr(self.adapter, "clips", ()):        # the controller's writes pass no guard, so a limit that stopped one is on the record here
+            self.log("write_clipped", **c)
+        if getattr(self.adapter, "clips", None):
+            self.adapter.clips = []
         self.rt_report()
         out = []
         for cid, sid in self.due_readings():

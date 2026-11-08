@@ -16,12 +16,12 @@ sends no event notice, because the contract already says when to prepare.
 """
 from __future__ import annotations
 
-import uuid
 from typing import Any, Callable
 
-from . import beckn
+from . import beckn, ids
 from .home_v2 import HomeV2
-from .market import firm_part
+from .market import PARTS, firm_part
+from .node import loans
 from .replay import Replay
 
 LIMIT_SHARE = 0.10        # of what is owed at a step: about what a 10 % margin covers
@@ -41,6 +41,7 @@ class Outbox:
         self.first: str | None = None
         self.last: str | None = None
         self.now: Callable[[], str] = lambda: ""
+        self.play: Callable[[], str] = ids.new_play      # QuietNode gives it the node's
 
     def __call__(self, to: str, kind: str, body: dict[str, Any], mid: str) -> Any:
         if beckn.action_of(kind) == "on_status" and "performance" in (body.get("message") or {}):
@@ -55,32 +56,75 @@ class Outbox:
         if not self.held or (Replay.minutes_between(self.last or now, now) < self.hold_min
                              and Replay.minutes_between(self.first or now, now) < MAX_HOLD_MIN):
             return
+        self.flush(now)
+
+    def flush(self, now: str, asked: str | None = None) -> None:
+        """Everything held goes now, one envelope per receiver. Its id names the play and the readings in it, not the moment it went: a day played again has a new play, so its
+        batches go (live, 6 Nov 2026: the ids repeated, Town refused them, and 192 homes and 3 buildings went unpaid), and a node that restarts with these readings still held
+        names the same batch. `asked`: the chase this batch answers, so a chase's batch is delivered even when it's the same readings."""
         for to, bodies in self.held.items():
             env = beckn.make("on_status", sender=self.name, receiver=to, transaction_id=f"readings-{self.name}",
                              message={"batch": bodies}, key=self.key, sender_role="bpp", ttl_s=beckn.TTL_EVIDENCE_S)
-            self.send(to, beckn.kind("on_status"), env, f"{self.name}:readings:{now}")
+            self.send(to, beckn.kind("on_status"), env, ids.sealed(None if asked else self.key, asked or self.play(), self.name, to, "on_status", "readings", ids.readings(bodies)))
         self.held = {}
+
+
+def offer_nothing(offer: dict[str, Any]) -> dict[str, Any]:
+    """What a node an alarm holds offers: no kW, and an evening with no rebound and no car to restart. Its devices have gone back to their own day, so the offer says so, and the
+    pool and the guard count nothing it can't give. Nothing held back either, so the second round doesn't ask it."""
+    from .brain import scale_offer
+    out = scale_offer(offer, 0.0, False, False)
+    out["slots"] = [{**x, **{k: 0.0 for k in PARTS + ("firm_kw", "tentative_kw") if k in x}} for x in out["slots"]]
+    out["energy_kwh"] = 0.0
+    out.pop("held_back_kw", None)
+    return out
 
 
 class PoolNode(HomeV2):
     """A node on the new path: every offer says what's firm and what's tentative. Its own estimate where it has one (node/sellable.py)."""
 
+    def reset(self) -> None:
+        super().reset()
+        loans.forget(self)
+
     def build_offer(self, need: dict[str, Any], fc: dict[str, Any]) -> dict[str, Any]:
-        offer = super().build_offer(need, fc)
+        return self.tag_offer(super().build_offer(need, fc))
+
+    def alarm_holds(self) -> bool:
+        """An alarm holds this node, until a person's signed word ends it."""
+        ov = getattr(self.adapter, "overrides", None) or {}
+        return bool(ov.get("alarm")) or "alarm_hold" in ov
+
+    def send_offer(self, txn: str, offer: dict[str, Any], asked: str | None = None) -> dict[str, Any]:
+        """Every offer leaves through here: the first, one asked for again and a second round's. While an alarm holds the node it offers nothing. On a dry day three held nodes offered,
+        were sold and accepted, delivered nothing and were paid nothing, and the sellers came in $52.41 short of the honest day: their share could have gone to the others."""
+        if self.alarm_holds():
+            offer = self.offers[offer["event_id"]] = offer_nothing(offer)
+            self.log("v2_offer_held", event_id=offer["event_id"], why="an alarm holds this node")
+        return super().send_offer(txn, offer, asked)
+
+    def verify_contract(self, sender: str, body: dict[str, Any]) -> dict[str, Any]:
+        """An alarm that came after the offer: the node says no, and the coordinator gives its share to an offer it has spare (Market.top_up)."""
+        v = super().verify_contract(sender, body)
+        if v["decision"] == "ACCEPTED" and self.alarm_holds():
+            return {"decision": "DECLINED", "reason": "an_alarm_holds_this_node", "contract_id": v.get("contract_id")}
+        return v
+
+    def tag_offer(self, offer: dict[str, Any]) -> dict[str, Any]:
         for x in offer["slots"]:
             f = firm_part(offer, x)
             x["firm_kw"], x["tentative_kw"] = round(f, 3), round(float(x.get("kw_offered") or 0.0) - f, 3)
         return offer
 
-    def rt_answer(self, txn: str, ask: dict[str, Any]) -> str:
+    def rt_answer(self, txn: str, ask: dict[str, Any], asked: str | None = None) -> str:
         """A node that has left the sale adds nothing: its plan has stopped, so a yes here would be a promise nobody keeps."""
         ov = self.adapter.overrides or {}
         if not (ov.get("alarm") or ov.get("stop") or ov.get("closed")):
-            return super().rt_answer(txn, ask)
+            return super().rt_answer(txn, ask, asked)
         why = self._rt_reason()
         body = beckn.make("rt_answer", sender=self.name, receiver=self.coordinator, transaction_id=txn,
                           message={"answer": {"id": ask["id"], "kw": 0.0, "why": why}}, key=self.key, sender_role="bpp")
-        self.send(self.coordinator, beckn.kind("rt_answer"), body, f"{self.name}:rt_answer:{ask['id']}:{uuid.uuid4().hex[:6]}")   # a second round asks under the same id
+        self.send(self.coordinator, beckn.kind("rt_answer"), body, self.mid(self.coordinator, "rt_answer", ask["id"], asked=asked))
         self.log("rt_answer", call_id=ask["id"], kw=0.0, why=why)
         return f"can add nothing for {ask['id']}: {why}"
 
@@ -91,8 +135,10 @@ class PoolNode(HomeV2):
         """Life safety (SPEC section 6, step 1): on an alarm nothing more is sent and every limit releases. The sale's plan writes through the controller, not the
         agent's guard, so it has to stop here: the devices go back to their own day, and the node tells the desk at once. Only a person clears it."""
         ov = self.adapter.overrides or {}
-        if ov.get("alarm") and not ov.get("stop"):
+        if (ov.get("alarm") or "alarm_hold" in ov) and not ov.get("stop"):
             self.adapter.rt_override("stop", True)
+        if ov.get("note") and getattr(self, "agent", None) is None:
+            loans.ask(self)                                 # rules can't read a note, so a node with no agent borrows the model for it
         return super().tick()
 
 
@@ -104,6 +150,7 @@ class QuietNode(PoolNode):
         self.outbox = Outbox(name, key, send)
         super().__init__(name, cfg, adapter, replay, key, self.outbox, trusted, log, coordinator)
         self.outbox.now = self.now_ts
+        self.outbox.play = lambda: self.play
 
     def rt_report(self) -> None:
         ctl = getattr(self.adapter, "ctl", None)
@@ -137,7 +184,7 @@ class QuietNode(PoolNode):
             msg["abnormal"] = True                          # its meter no longer measures a cut: the settlement must leave it out
         body = beckn.make("rt_capacity", sender=self.name, receiver=self.coordinator, transaction_id=f"cap-{self.name}",
                           message=msg, key=self.key, sender_role="bpp")
-        self.send(self.coordinator, beckn.kind("rt_capacity"), body, f"{self.name}:rt_capacity:{now}")
+        self.send(self.coordinator, beckn.kind("rt_capacity"), body, self.mid(self.coordinator, "rt_capacity", now, ids.digest(msg)))
         self._rt_reported, self._rt_at, self._rt_why = short, now, why
         self.log("rt_capacity", short_kw=round(max(short.values(), default=0.0), 3), steps=len(short), reason=why)
 
@@ -153,3 +200,35 @@ class QuietNode(PoolNode):
         out = super().tick()
         self.outbox.tick(self.now_ts())
         return out
+
+    def handle(self, kind: str, sender: str, body: dict[str, Any]) -> str:
+        if beckn.action_of(kind) == "status" and "readings_wanted" in (body.get("message") or {}):
+            return self.gate(kind, sender, body) or self.send_again(body["message"]["readings_wanted"], ids.asked(body))
+        return super().handle(kind, sender, body)
+
+    def send_again(self, want: dict[str, Any], asked: str | None = None) -> str:
+        """The coordinator or a buyer lacks these readings. Each is made again from this node's own meter rows, signed afresh and sent at once. Money follows
+        the readings, so a seller must not go unpaid for a message nobody saw go missing. No contract id: a call's readings alone."""
+        cid = want.get("contract_id")
+        c = self.contracts.get(cid) or {}
+        rows, now_i = getattr(self.adapter, "recent", {}), self.now_idx()
+        sent, gone = [], []
+        ok = c.get("status") == "ACCEPTED"
+        extra = [x["id"] for x in c.get("commitments", []) if x.get("gap")] if ok else []    # a gap's half hour: this node knows it, the contract copies don't
+        for sid in sorted(set(want.get("slots") or []) | set(extra)):
+            s = next((x for x in c["commitments"] if x["id"] == sid), None) if ok else None
+            i0 = self.replay.idx_of(s["start"]) if s else None
+            if i0 is None or now_i <= i0 + 1 or i0 not in rows or i0 + 1 not in rows:
+                gone.append(sid)
+                continue
+            self.send_reading(c.get("transaction_id", ""), self.build_reading(cid, sid))
+            sent.append(sid)
+        for k, rt in self.contracts.items():                # a call's own readings were in the same lost envelope
+            if rt.get("rt") and rt.get("status") == "ACCEPTED":
+                for s in rt["commitments"]:
+                    i0 = self.replay.idx_of(s["start"])
+                    if s["id"] in rt["reported"] and i0 in rows and i0 + 1 in rows:
+                        self.send_reading(rt.get("transaction_id", ""), self.build_reading(k, s["id"]))
+        self.outbox.flush(self.now_ts(), asked)
+        self.log("v2_readings_sent_again", contract_id=cid, slots=sent, gone=gone)
+        return f"sent again {sent}, gone {gone}"

@@ -82,7 +82,8 @@ def _lines(src: Iterable[str]) -> Iterator[dict[str, Any]]:
 
 
 def serve(base: str, name: str, timeout: float = 30.0) -> None:
-    http = httpx.Client(timeout=timeout)
+    from . import doors
+    http = httpx.Client(timeout=timeout, headers=doors.headers())
     instructions = ("FlexGrid's tools for this agent. Every number you tell the person must come from a tool. "
                     "The tools read and change only what the agent's own code allows; safety limits always apply.")
 

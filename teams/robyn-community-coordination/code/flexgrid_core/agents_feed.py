@@ -21,7 +21,7 @@ import statistics
 from datetime import datetime
 from typing import Any
 
-from . import beckn, config
+from . import beckn, config, settlement as st
 
 SLOT_H = beckn.SLOT_MINUTES / 60
 HOME_NAMES = {"home-tesla": "Tesla home", "home-enphase": "Enphase home"}
@@ -108,8 +108,8 @@ def _usd(x: Any) -> float | None:
 def _llm(d: dict[str, Any]) -> dict[str, Any] | None:
     m = d.get("llm") or {}
     name = str(m.get("model") or "")
-    if d.get("fallback") and not name:
-        return {"model": None, "ms": None, "fallback": True, "runtime": None, "error": m.get("error")}
+    if (d.get("fallback") or d.get("routine")) and not name:       # routine: code's own answer, with nothing to ask
+        return {"model": None, "ms": None, "fallback": bool(d.get("fallback")), "runtime": None, "error": m.get("error")}
     return {"model": model_label(name) or model_label(mac_model()), "ms": m.get("ms"), "fallback": bool(d.get("fallback")),
             "runtime": m.get("runtime"), "error": m.get("error")}
 
@@ -217,7 +217,7 @@ def protocol_line(x: dict[str, Any], price: float | None) -> dict[str, Any] | No
             return {"from": "buyer", "to": None if agent else "coordinator", "kind": "decision" if agent else "message",
                     "role": "need",
                     "text": f"Orders {_kw(kw)} kW less grid import for each half hour, {str(w[0])[11:16]}–{str(w[1])[11:16]} "
-                            f"on {_day(w[0])}, at ${float(p or 0):.2f} per kWh",
+                            f"on {_day(w[0])}, at {st.up_to()}${float(p or 0):.2f} per kWh",
                     "kw": kw, "price": p, "by": x.get("buyer"),
                     "money": {"usd": -round(kwh * float(p or 0), 2),
                               "what": f"at most, if all {kwh:.0f} kWh are delivered"} if hours else None}
@@ -240,7 +240,7 @@ def protocol_line(x: dict[str, Any], price: float | None) -> dict[str, Any] | No
         if k == "rt_call":
             what = "Grid emergency" if x.get("call_kind") == "emergency" else "Short-notice call"
             return L("buyer", "coordinator", "rt", f"{what}: {_kw(x.get('kw'))} kW more from {str(x.get('start'))[11:16]} "
-                                               f"to {str(x.get('end'))[11:16]} at ${float(x.get('price') or 0):.2f} per kWh "
+                                               f"to {str(x.get('end'))[11:16]} at {st.up_to()}${float(x.get('price') or 0):.2f} per kWh "
                                                f"({x.get('why')})", kw=x.get("kw"), price=x.get("price"))
         if k == "what_if_price":
             return None                                         # the presenter's line says it
@@ -261,7 +261,7 @@ def protocol_line(x: dict[str, Any], price: float | None) -> dict[str, Any] | No
                  f"Market cleared: sells {_kw(_mean(cap))} kW in each half hour (asked {_kw(_mean(raw))}); "
                  f"{x.get('homes')} homes asked for a share, {float(x.get('margin') or 0):.0%} more than sold",
                  kw=_mean(cap), price=price,
-                 money={"usd": round(sold * float(price or 0), 2), "what": "for the community, if delivered"}
+                 money={"usd": round(sold * float(price or 0), 2), "what": "at most, for the community, if delivered"}
                  if cap and price else None)
     if k == "v2_commitments_sent":
         return L("coordinator", "all", "commit", f"Commitments sent to {x.get('homes')} homes")
@@ -276,12 +276,13 @@ def protocol_line(x: dict[str, Any], price: float | None) -> dict[str, Any] | No
         return L("coordinator", "buyer", "report", f"Readings are in: {x.get('readings')} signed readings from "
                                                    f"{x.get('meters')} homes")
     if k == "v2_settled":
-        return L("coordinator", "all", "money", f"Pays ${float(x.get('seller_usd') or 0):.2f} to {x.get('homes_paid')} "
-                                                f"homes, pro rata to what each delivered",
-                 money={"usd": _usd(x.get("seller_usd")), "what": f"to {x.get('homes_paid')} homes"})
+        paid = x.get("nodes_usd", x.get("seller_usd"))      # the bills are the buyers': the nodes get their shares of them
+        return L("coordinator", "all", "money", f"Pays ${float(paid or 0):.2f} to {x.get('homes_paid')} "
+                                                f"homes, by the rule in their contracts",
+                 money={"usd": _usd(paid), "what": f"to {x.get('homes_paid')} homes"})
     if k == "rt_call":
         return L("coordinator", "all", "rt", f"Asks every home how much more it can give, {str(x.get('start'))[11:16]}–"
-                                             f"{str(x.get('end'))[11:16]}, at ${float(x.get('price') or 0):.2f} per kWh")
+                                             f"{str(x.get('end'))[11:16]}, at {st.up_to()}${float(x.get('price') or 0):.2f} per kWh")
     if k == "rt_dispatched":
         if x.get("call_kind") == "gap":
             return L("coordinator", "all", "rt", f"Moves the gap to {x.get('homes')} other homes: {_kw(x.get('confirmed_kw'))} kW covered"

@@ -41,7 +41,7 @@ class ZoneMap:
         s = _schedules()
         r = s["row"].get(f'{self.m["schedule"]}/{self.spaces[space]["schedule"]}')
         d = s["day"].get(ts[:10])
-        return 0.0 if r is None or d is None else float(s[kind][r, d, int(ts[11:13])])
+        return 1.0 if r is None or d is None else float(s[kind][r, d, int(ts[11:13])])     # no record reads as in use: the guard's "unknown counts as occupied"
 
     def plan(self, space: str, ts: str) -> float:
         """The share of this space in use at this hour, by the plan made the day before."""

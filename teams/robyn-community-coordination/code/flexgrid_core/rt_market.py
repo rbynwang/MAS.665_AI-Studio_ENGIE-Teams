@@ -3,7 +3,7 @@ moves power between homes within minutes. Beside the day-ahead market (market.py
 
 Messages (signed Beckn bodies on the same transport as the day-ahead ones; actions FlexGrid adds to the DEG set):
   rt_call      buyer -> coordinator   kW wanted from `start` to `end`, the price, why (a short-notice need, an emergency)
-  rt_ask       coordinator -> homes   one broadcast: how much can you add from start to end, at this price?
+  rt_ask       coordinator -> homes   how much can you add from start to end, at this price? (one broadcast, or a wave at a time on the quiet path)
   rt_answer    home -> coordinator    the kW it can add evenly over the call (its 5-minute plan's answer; 0 if none)
   rt_dispatch  coordinator -> home    kW owed on top of its booking, per 15 minutes, and the price
   rt_capacity  home -> coordinator    "I will be short by kW at these steps" (an owner's wish, a storm, a battery trip):
@@ -13,20 +13,22 @@ Messages (signed Beckn bodies on the same transport as the day-ahead ones; actio
   rt_confirm   coordinator -> buyer   kW confirmed per 15 minutes and what is short (sent at once, again when it changes)
   rt_end       buyer -> coordinator   the call is over early: the remaining dispatch is released
 Readings for dispatched steps go out like the event's (homes' signed on_status, to the coordinator and the meter
-owner), under the call's id. The buyer pays the call's price for what its meters measured on top of the booking.
+owner), under the call's id. The buyer pays for what its meters measured on top of the booking: each class's rate on the pool, the call's price on the one-buyer path.
 
-On the quiet path (cfg report_rule "exception", report_rule.py) the desk works from what it already knows: it asks only the members whose
-offers still have room, biggest first, until their room covers the need, instead of everyone. A member with nothing to add isn't asked
+On the quiet path (cfg report_rule "exception", report_rule.py) the desk works from what it already knows: for a gap it asks only the members
+whose offers still have room, biggest first, until their room covers the need, instead of everyone. A member with nothing to add isn't asked
 again for half an hour. No readings reach it during the window, so a report beyond a node's limits counts as it stands.
+A buyer's call is different: an offer is what a node chose to sell for the whole window, not all it can give for an hour, so room on file decides
+nothing. The desk asks by what each node's offer says it holds, a wave at a time, dispatches what each wave brings, and asks the next while the call
+is short. The node answers what it can add, its code holds the limits, and the desk only asks.
 """
 from __future__ import annotations
 
 import math
 import time
-import uuid
 from typing import Any
 
-from . import beckn
+from . import beckn, ids, meter_check as mc
 from . import settlement as st
 
 ANSWER_WAIT_MIN = 5          # dataset minutes the desk waits for answers before it allocates
@@ -34,14 +36,19 @@ ANSWER_WAIT_S = 25.0         # live, also this many real seconds (NANDA Town bri
                              # checks an idle home's inbox every 15 s); cfg rt_answer_wait_s
 MARGIN = 0.10                # asks the homes for this much more than it confirms (as the day-ahead clearing does)
 PRICE_LADDER = (1.0, 1.25, 1.5)   # a gap the first round cannot fill is offered again at these multiples
-ASK_COVER = {"gap": 1.5, "call": 2.0}   # the quiet path asks members whose known room covers the need this many times
+ASK_COVER = 1.5              # the quiet path asks members whose known room covers a gap this many times
+ASK_WAVE = 32                # a call asks this many members first, and twice as many each time it's still short. An ask and its answer are 1.3 kB and Town takes
+                             # about 5 kB/s: this wave is 9 s of it, all 203 members a minute, and the three buildings at the top of the list hold nine tenths of what the answers offer
 NO_ROOM_MIN = 30             # the quiet path doesn't ask a member with nothing to add again for this long
 WARN_AGAIN_SHARE = 0.25      # the quiet path warns a buyer again only when the shortfall changes by this share
 MIN_GAP_SHARE = 0.005        # the quiet path moves no gap under this share of what's sold: it costs more messages than it's worth
 QUIET_CUSHION = 0.5          # the quiet path counts on this part of the margin, because small shortfalls go unreported and spend the rest
+CHASE_EVERY_MIN = 30         # a call settled short: nodes are asked again after this long, and each gap doubles
+CHASE_FOR_MIN = 1440         # for this long after the call
 # what a node may say about a shortfall on the pool. Free text here would reach the buyers and the coordinator's model, so anything else reads "not given"
 KNOWN_REASONS = {"the forecast changed", "the owner left the event", "the owner needs the car now", "its battery tripped", "the owner changed the comfort limit",
-                 "the building closed for the day", "an event was added in a sold zone", "an alarm is on"}
+                 "the building closed for the day", "an event was added in a sold zone", "an alarm is on",
+                 "a device is out", "the schedule changed", "an owner's need came first", "another cause"}     # what a node's agent may say (node/context.py SHORT_WORDS)
 
 
 def real(v: Any) -> float | None:
@@ -66,6 +73,7 @@ class RtDesk:
         self.m = market
         self.calls: dict[str, dict[str, Any]] = {}      # call or gap id -> record
         self.reports: dict[str, dict[str, float]] = {}  # home -> {ts: kW short} as last reported
+        self.report_wall: dict[str, float] = {}         # home -> when that report was made: a retry can come after the next one
         self.reasons: dict[str, str] = {}
         self.dirty = False                              # a report came since the last check
         self.checked_at: str | None = None
@@ -75,14 +83,21 @@ class RtDesk:
         self.abnormal: dict[str, str] = {}              # member -> when it said its meter stopped measuring a cut (a building closed)
 
     # ------------------------------------------------------------------ helpers
+    def play(self) -> str:
+        return getattr(self.m, "play", "")
+
+    def _mid(self, to: str, action: str, txn: str, *key: Any) -> str:
+        return ids.sealed(getattr(self.m, "key", None), self.play(), self.m.name, to, action, txn, *key)
+
     def _send(self, to: str, action: str, txn: str, message: dict[str, Any]) -> None:
         body = self.m._msg(action, to, txn, message)
-        self.m._send(to, action, body, f"{self.m.name}:{action}:{txn}")
+        self.m._send(to, action, body, self._mid(to, action, txn, ids.digest(message)))
 
-    def _item(self, to: str, action: str, txn: str, message: dict[str, Any]) -> tuple:
+    def _item(self, to: str, action: str, txn: str, message: dict[str, Any], *key: Any) -> tuple:
         """One message for Market._broadcast: sent in the background (live), so the market lock is not held through
-        a Town round trip per home while the homes' answers wait to be handled."""
-        return (to, action, self.m._msg(action, to, txn, message), f"{self.m.name}:{action}:{txn}")
+        a Town round trip per home while the homes' answers wait to be handled. key: what it is, or by default what it says: a buyer's confirm goes again when it changes, and
+        the same words again are a retry."""
+        return (to, action, self.m._msg(action, to, txn, message), self._mid(to, action, txn, *(key or (ids.digest(message),))))
 
     def _buyers(self) -> list[str]:
         return list(getattr(self.m, "buyers", None) or [self.m.utility])
@@ -148,22 +163,49 @@ class RtDesk:
         return None
 
     def _short_list(self, rec: dict[str, Any], homes: list[str]) -> list[str]:
-        """Who to ask. Everyone, except on the quiet path."""
+        """Who to ask. Everyone, except on the quiet path: there a buyer's call goes by size, a wave at a time, and a gap goes to the members with room on file."""
         if not self._quiet():
             return homes
+        if rec["kind"] != "gap":
+            return self._wave(rec, self._ranked(homes))
         now = self.m.now()
         homes = [h for h in homes if self.no_room.get(h, "") <= now]
         rooms = {h: self._room(h, rec) for h in homes}
         if any(v is None for v in rooms.values()):
             return homes                                # no offers on file for these steps: nothing to choose by
-        want = float(rec["kw"]) * ASK_COVER["gap" if rec["kind"] == "gap" else "call"]
+        want = float(rec["kw"]) * ASK_COVER
         out, got = [], 0.0
         for h in sorted(rooms, key=lambda x: (-rooms[x], x)):
             if rooms[h] < 0.05 or got >= want:
                 break
             out.append(h)
             got += rooms[h]
+        if got < want and getattr(self.m, "fill", False):  # room on file is the offer. A sale that fills to the order leaves little of it, and what a node can do now only its answer says
+            out += self._wave(rec, self._ranked([h for h in rooms if h not in out]))
         return out
+
+    def _size(self, h: str) -> float:
+        """What this member's offers on file say it holds, whatever it chose to sell: its biggest offer, or its battery, cooling and lighting before anyone's share. A node that
+        cut its offer or sat the sale out is as big as it was. It only says who to ask first: on 14 Jul the three buildings gave 92% of the answers, and among homes no figure on file did much better."""
+        out = 0.0
+        for e in self.m.events.values():
+            o = e["offers"].get(h) or {}
+            held = sum(real(o[k].get(f)) or 0.0 for k, f in (("battery", "kw"), ("air_conditioning", "raw_kw"), ("lighting", "raw_kw")) if isinstance(o.get(k), dict))
+            out = max([out, held] + [float(x.get("kw_offered") or 0.0) for x in o.get("slots", [])])
+        return out
+
+    def _ranked(self, homes: list[str]) -> list[str]:
+        """Who to ask first, known without a message: the biggest first. A member short of its own booking, or that said it had nothing in the last half hour, counts for a tenth:
+        a shorter window can change its answer, so it isn't left out, and a building stays above the homes."""
+        now = self.m.now()
+        short = {h for h, r in self.reports.items() if any(t > now for t in r)}
+        return sorted(homes, key=lambda h: (-self._size(h) * (0.1 if h in short or self.no_room.get(h, "") > now else 1.0), h))
+
+    def _wave(self, rec: dict[str, Any], homes: list[str]) -> list[str]:
+        """The next part of the list. The rest waits in the record until the answers in hand fall short."""
+        n = ASK_WAVE * 2 ** rec.get("waves", 0)
+        rec["waves"], rec["queue"] = rec.get("waves", 0) + 1, homes[n:]
+        return homes[:n]
 
     def _ask(self, rec: dict[str, Any], homes: list[str]) -> None:
         homes = self._short_list(rec, homes)
@@ -172,8 +214,7 @@ class RtDesk:
             return
         msg = {"ask": {"id": rec["id"], "start": rec["start"], "end": rec["end"], "price_usd_per_kwh": rec["price"],
                        "kind": rec["kind"]}}
-        items = [(h, "rt_ask", self.m._msg("rt_ask", h, rec["id"], msg), f"{self.m.name}:rt_ask:{rec['id']}")
-                 for h in homes]
+        items = [self._item(h, "rt_ask", rec["id"], msg, rec.get("round", 0), rec.get("waves", 0)) for h in homes]      # a second round or wave may ask a member again
         self.m._broadcast(items)
         rec["asked"] = sorted(set(rec.get("asked", [])) | set(homes))
         rec["asked_at"] = self.m.now()
@@ -191,7 +232,7 @@ class RtDesk:
                 self.m.log("rt_call_refused", call_id=c["id"], why=why)
                 self.m._broadcast([self._item(sender, "rt_confirm", str(c["id"]), {"confirm": {
                     "id": c["id"], "kw": 0.0, "short_kw": real(c.get("kw")) or 0.0, "homes": [], "refused": why}})])
-                return f"call {c['id']} refused: {why}"
+                return beckn.Refused(f"call {c['id']} refused: {why}")
             rec = {"id": c["id"], "kind": c.get("kind", "short_notice"), "start": c["start"], "end": c["end"],
                    "kw": float(c["kw"]), "price": float(c["price_usd_per_kwh"]), "why": c.get("why", ""),
                    "from": sender, "answers": {}, "alloc": {}, "round": 0, "phase": "asking",
@@ -205,14 +246,14 @@ class RtDesk:
                 self.m.log("rt_call_too_late", call_id=c["id"], end=rec["end"], received_at=rec["received_at"])
                 self.m._broadcast([self._item(sender, "rt_confirm", c["id"], {"confirm": {
                     "id": c["id"], "kw": 0.0, "short_kw": rec["kw"], "homes": [], "too_late": True}})])
-                return f"call {c['id']} arrived after its window ({rec['end']}): confirmed 0 kW"
+                return beckn.Refused(f"call {c['id']} arrived after its window ({rec['end']}): confirmed 0 kW")
             self._ask(rec, list(self.m.roster))
-            return f"call {c['id']}: asked {len(self.m.roster)} homes"
+            return f"call {c['id']}: asked {len(rec.get('asked', []))} homes"
         if act == "rt_answer":
             a = m["answer"]
             rec = self.calls.get(a["id"])
             if not rec or sender not in rec.get("asked", []):
-                return "answer ignored"
+                return beckn.Refused("answer ignored")
             kw = max(0.0, real(a.get("kw", 0.0)) or 0.0)
             rec["answers"][sender] = {"kw": min(kw, getattr(self.m, "rated", {}).get(sender, kw)), "why": a.get("why")}      # no more than its nameplate
             if rec["answers"][sender]["kw"] < 0.05 and "price" not in str(a.get("why") or ""):
@@ -224,7 +265,11 @@ class RtDesk:
             pooled = getattr(self.m, "pooled", False)
             if pooled and sender not in self.m.roster:
                 self.m.log("rt_report_refused", sender=sender)
-                return "report ignored: not a member"
+                return beckn.Refused("report ignored: not a member")
+            made = float((body.get("context") or {}).get("sentWall") or 0.0)
+            if made < self.report_wall.get(sender, 0.0):
+                return beckn.Refused("report ignored: a newer one is in")
+            self.report_wall[sender] = made
             short = self._checked_short(sender, m.get("short")) if pooled \
                 else {ts: float(kw) for ts, kw in (m.get("short") or {}).items() if float(kw) > 0.0}
             self.reports[sender] = short
@@ -239,7 +284,7 @@ class RtDesk:
         if act == "rt_end" and sender in self._buyers():
             rec = self.calls.get((m.get("end") or {}).get("id"))
             if not rec or rec.get("from") != sender:
-                return "end for an unknown call"
+                return beckn.Refused("end for an unknown call")
             if rec.get("end_early"):                        # at-least-once delivery: a second release would take the node below its booking
                 return f"call {rec['id']} already ended"
             at = (m.get("end") or {}).get("at") or self.m.now()
@@ -249,16 +294,16 @@ class RtDesk:
                 rest = {t: -kw for t, kw in slots.items() if t >= at}
                 if rest:
                     items.append(self._item(h, "rt_dispatch", rec["id"], {"dispatch": {"id": rec["id"], "steps": rest,
-                                                                                       "release": True}}))
+                                                                                       "release": True}}, "release"))
             if items:
                 self.m._broadcast(items)
             self.m.log("rt_end", call_id=rec["id"], at=at)
             return f"call {rec['id']} ended at {at}"
         if act == "on_status" and sender in self._buyers() and (m.get("settlement") or {}).get("call_id") in self.calls:
-            return self.settle(m["settlement"])
+            return self.settlement_in(sender, m["settlement"])
         if act == "on_status" and "performance" in m and m["performance"].get("event_id") in self.calls:
             r = m["performance"]
-            self.calls[r["event_id"]]["readings"].setdefault(sender, {})[r["slot_id"]] = r
+            self.calls[r["event_id"]]["readings"].setdefault(sender, {}).setdefault(r["slot_id"], r)
             return f"call reading {sender} slot {r['slot_id']}"
         return None
 
@@ -291,31 +336,37 @@ class RtDesk:
         """Live: the answers in hand already cover the call and its margin (or the gap), so the desk dispatches now
         instead of waiting for the last homes (over NANDA Town the last of 100 answers came 30 s after the first, three
         15-minute steps at the demo's pace, 1 Nov 2026). The offline simulation delivers every answer at once and
-        keeps waiting for all of them, so its results do not change."""
-        if self.m.cfg.get("sync_broadcast"):
+        keeps waiting for all of them, so its results do not change. With the clock waiting for the agents (cfg
+        clock_waits) the desk waits for every answer too, as offline: a held step costs no sim time, and otherwise the
+        answer that happened to come first through Town would decide who covers a gap."""
+        if self.m.cfg.get("sync_broadcast") or self.m.cfg.get("clock_waits"):
             return False
         want = rec["kw"] * (1.0 + (MARGIN if rec["kind"] != "gap" else 0.0))
         return sum(a["kw"] for a in rec["answers"].values() if a["kw"] >= 0.05) >= want - 1e-9
 
     def allocate(self, rec: dict[str, Any]) -> None:
         """Fill the call (plus the margin) from the biggest answers first, evenly over its steps; tell each home what
-        it owes on top, tell the buyer what is confirmed. A gap: the same, for the steps it was short."""
-        want = rec["kw"] * (1.0 + (MARGIN if rec["kind"] != "gap" else 0.0))
-        left, alloc = want, {}
+        it owes on top, tell the buyer what is confirmed. A gap: the same, for the steps it was short. A call still short
+        goes on to its next wave, and what that wave brings is dispatched on top of this."""
+        call = rec["kind"] != "gap"
+        over = 1.0 + (MARGIN if call else 0.0)
+        steps = steps_between(rec["start"], rec.get("end_early") or rec["end"])
+        if not call:                                    # only the steps the home said it would miss, at its size
+            steps = sorted(rec["short_by_ts"])
+        elif self._quiet():                             # a later wave comes when the call may be running: nobody owes a step that's gone
+            steps = [t for t in steps if t >= self.m.now()]
+        left, alloc = rec["kw"] * over - rec.get("dispatched_kw", 0.0), {}
         for h, a in sorted(rec["answers"].items(), key=lambda x: (-x[1]["kw"], x[0])):
-            if left <= 1e-3:
+            if left <= 1e-3 or not steps:
                 break
             kw = min(a["kw"], left)
-            if kw >= 0.05:
+            if kw >= 0.05 and not (call and h in rec["alloc"]):     # a wave's answers only: Town can bring an answer twice, and a node dispatched twice would owe it twice
                 alloc[h] = round(kw, 3)
                 left -= kw
-        steps = steps_between(rec["start"], rec["end"])
-        if rec["kind"] == "gap":                        # only the steps the home said it would miss, at its size
-            steps = sorted(rec["short_by_ts"])
         parent = rec.get("parent") or {}
         items = []
         for h, kw in alloc.items():
-            per = {t: (kw * min(1.0, rec["short_by_ts"][t] / rec["kw"]) if rec["kind"] == "gap" else kw) for t in steps}
+            per = {t: (kw if call else kw * min(1.0, rec["short_by_ts"][t] / rec["kw"])) for t in steps}
             rec["alloc"][h] = {t: round(v, 3) for t, v in per.items() if v > 1e-3}
             rec.setdefault("asked_price", {})[h] = rec["price"]
             did = parent["id"] if parent.get("kind") == "call" else rec["id"]     # covering a call: owed under the call
@@ -326,30 +377,42 @@ class RtDesk:
             items.append(self._item(h, "rt_dispatch", did, {"dispatch": {"id": did, "steps": rec["alloc"][h],
                                                                          "price_usd_per_kwh": rec["price"], "kind": rec["kind"],
                                                                          "start": rec["start"], "end": rec["end"],
-                                                                         **({"event_id": parent["id"]} if parent.get("kind") == "event" else {})}}))
-        got = sum(alloc.values())
-        confirmed = round(min(rec["kw"], got / (1.0 + (MARGIN if rec["kind"] != "gap" else 0.0))), 3)
+                                                                         **({"event_id": parent["id"]} if parent.get("kind") == "event" else {})}},
+                                    rec["id"], rec.get("round", 0), rec.get("waves", 0)))     # never by what it says: a node adds up what it's dispatched, and two gaps can ask the same
+        rec["dispatched_kw"] = rec.get("dispatched_kw", 0.0) + sum(alloc.values())
+        first = "confirmed_kw" not in rec
+        confirmed = round(min(rec["kw"], rec["dispatched_kw"] / over), 3)
         rec.update({"phase": "dispatched", "confirmed_kw": confirmed, "short_kw": round(max(0.0, rec["kw"] - confirmed), 3),
-                    "allocated_at": self.m.now(), "homes": len(alloc)})
+                    "allocated_at": self.m.now(), "homes": len(rec["alloc"]) if call else len(alloc)})
         self.m.log("rt_dispatched", call_id=rec["id"], call_kind=rec["kind"], homes=len(alloc), confirmed_kw=confirmed,
                    short_kw=rec["short_kw"], answers=len(rec["answers"]))
-        if rec["kind"] != "gap":
+        if call and (first or alloc):                   # the buyer hears at once, and again when it changes
             items.append(self._item(rec.get("from") or self.m.utility, "rt_confirm", rec["id"],
-                                    {"confirm": {"id": rec["id"], "kw": confirmed, "short_kw": rec["short_kw"], "homes": sorted(alloc)}}))
+                                    {"confirm": {"id": rec["id"], "kw": confirmed, "short_kw": rec["short_kw"], "homes": sorted(rec["alloc"])}}))
         if items:                                       # the dispatches (and the buyer's confirm) in the background
+            items += self._who_owes(rec)
             self.m._broadcast(items)
-        if rec["kind"] == "gap" and rec["short_kw"] > 0.05:
+        if not call and rec["short_kw"] > 0.05:
             if rec["round"] + 1 < len(PRICE_LADDER):
                 self._raise(rec)                       # the first round did not cover it: once more, at a higher price
             else:
                 self._warn(rec)
+        elif call and rec["short_kw"] > 0.05 and rec.get("queue") and steps and not rec.get("end_early"):
+            rec["phase"] = "asking"
+            self._ask(rec, rec["queue"])
+
+    def _who_owes(self, rec: dict[str, Any]) -> list[tuple]:
+        """The call's list of who owes what, for its buyer: it pays only those the desk dispatched, and a gap's helper owes under the call too."""
+        parent = rec.get("parent") or {}
+        call = rec if rec["kind"] != "gap" else self.calls.get(parent.get("id")) if parent.get("kind") == "call" else None
+        return [self._item(call.get("from") or self.m.utility, "rt_confirm", call["id"], {"dispatched": {"id": call["id"], "alloc": call["alloc"]}})] if call else []
 
     def _raise(self, rec: dict[str, Any]) -> None:
         """Offer what is left once more, at the next price on the ladder, to the homes that could cover it and have not
         been dispatched for it yet (a home below its owner's minimum price may now say yes). Nobody left: warn."""
         rec["round"] += 1
         rec["price"] = round(rec["price"] * PRICE_LADDER[rec["round"]] / PRICE_LADDER[rec["round"] - 1], 4)
-        rec["kw"] = rec["short_kw"]
+        rec["kw"], rec["dispatched_kw"] = rec["short_kw"], 0.0
         rec["short_by_ts"] = {t: v * rec["short_kw"] / max(1e-6, max(rec["short_by_ts"].values())) for t, v in rec["short_by_ts"].items()}
         rec["answers"], rec["phase"] = {}, "asking"
         short_now = {h for h, r in self.reports.items() if any(t > self.m.now() for t in r)}
@@ -373,29 +436,116 @@ class RtDesk:
             self._send(b, "rt_confirm", rec["id"], {"warning": {"id": rec["id"], "short_kw": rec["short_kw"], "start": rec["start"],
                                                                 "end": rec["end"], "why": rec["why"]}})
 
-    def settle(self, s: dict[str, Any]) -> str:
-        """Pay each home the share of the call's payment its measured extra earned (the coordinator keeps its fee)."""
+    def settlement_in(self, sender: str, s: dict[str, Any]) -> str:
+        """A buyer's settlement of a call, at its door. What can't be paid on is refused and on the alarm, and nothing about the call changes: a settlement that can be read is taken when it comes."""
         rec = self.calls[s["call_id"]]
-        if rec.get("settled"):
-            return f"call {rec['id']} already paid"
-        rec["settled"] = s
+        if not getattr(self.m, "pooled", False):
+            return self.settle(s)
+        why = mc.call_settlement_problem(s, rec, sender, float(rec["kw"]) * 0.25 * len(steps_between(rec["start"], rec["end"])))
+        try:
+            out = None if why else self.settle(s)
+        except (KeyError, TypeError, ValueError, AttributeError, IndexError, OverflowError) as exc:
+            out, why = None, f"{type(exc).__name__}: {exc}"[:160]
+        if why:
+            rec["settlement_refused"] = why
+            self.m.log("rt_settlement_refused", call_id=rec["id"], buyer=sender, why=why)
+            return beckn.Refused(f"settlement refused: {why}")
+        rec.pop("settlement_refused", None)
+        return out
+
+    def _checked_full(self, rec: dict[str, Any], s: dict[str, Any], word: float | None, bill: float, buildings: set[str]) -> float:
+        """A call's full price, as market._checked_full has a sale's: its kWh at the call's price, worked out here. The buyer's word stands when it says the same. Its delivered_kwh has 3 places."""
+        price = real(rec.get("price"))
+        if price is None:
+            return bill if word is None else word
+        own = round(float(s.get("delivered_kwh") or 0.0) * price, 4)
+        room = 0.01 + 0.0006 * price
+        right = word is not None and abs(word - own) <= room
+        wrong = [] if right or (word is None and own <= room) else [f"its full price is ${word:,.2f}, and its kWh come to ${own:,.2f}" if word is not None else f"it gave no full price, and its kWh come to ${own:,.2f}"]
+        full = word if right else own
+        top = st.call_bill(full, s.get("by_home_kwh") or {}, s.get("by_home_batt_kwh") or {}, buildings)
+        if abs(bill - top) > room:
+            wrong.append(f"its bill is ${bill:,.2f}, and its kWh come to ${top:,.2f}")
+        rec.pop("differs", None)
+        if wrong:
+            rec["differs"] = "; ".join(wrong)
+            self.m.log("rt_buyer_word_differs", call_id=rec["id"], why=rec["differs"])
+        return full
+
+    def settle(self, s: dict[str, Any]) -> str:
+        """Pay each node the call's price on the extra it measured, times its class's share. The coordinator keeps what's left of the bill: settlement.call_bill sets it to the book's part."""
+        rec = self.calls[s["call_id"]]
+        again = bool(rec.get("settled")) and bool(s.get("top_up"))
+        if rec.get("settled") and (not again or int(s["top_up"]) <= int(rec["settled"].get("top_up") or 0)):
+            return f"call {rec['id']} already paid"       # delivered again, or an older top-up after a newer one
         sp = st.split(float(s.get("paid_usd", 0.0)), {h: float(v) for h, v in (s.get("by_home_kwh") or {}).items()}, self.m.fee)
         if st.MARKET and getattr(self.m, "pooled", False):    # the price book's shares, as in the booking
-            sp = st.call_shares(float(s.get("paid_usd", 0.0)), s.get("by_home_kwh") or {}, s.get("by_home_batt_kwh") or {},
-                                {h for ev in self.m.events.values() for h, o in ev["offers"].items() if o.get("node") == "building"})
+            bill = real(s.get("paid_usd", 0.0))
+            word = real(s.get("full_price_usd", bill))
+            if bill is None or word is None or bill < 0 or word < 0:
+                raise ValueError("a call's settlement with no real sum")      # as junk kWh: it isn't taken for one that was paid
+            buildings = {h for ev in self.m.events.values() for h, o in ev["offers"].items() if o.get("node") == "building"}
+            full = self._checked_full(rec, s, word if "full_price_usd" in s else None, bill, buildings)
+            sp = st.call_shares(full, s.get("by_home_kwh") or {}, s.get("by_home_batt_kwh") or {}, buildings, bill)
+        missing = self.lacking(rec, s.get("read"))
+        rec["settled"] = s                                  # only now: a settlement that can't be read isn't taken for one that was paid
         items = []
+        paid0, round_no = rec.setdefault("paid_by_home", {}), rec.get("top_ups", 0) + 1
         for h, usd in sp["per_home"].items():
-            msg = {"settlement": {"event_id": rec["id"], "payment": usd, "currency": s.get("currency", "USD"),
+            if h not in rec["alloc"]:                        # the buyer's list came unchecked (its confirm was lost): the desk pays only those it dispatched
+                self.m.log("rt_pay_refused", call_id=rec["id"], home=h, usd=usd)
+                continue
+            pay = round(usd - paid0.get(h, 0.0), 4) if again else usd
+            if again and pay < 0.005:                        # a top-up adds what the new share is owed, and takes nothing back
+                continue
+            paid0[h] = round(paid0.get(h, 0.0) + pay, 4)
+            msg = {"settlement": {"event_id": rec["id"], "payment": pay, "currency": s.get("currency", "USD"),
                                   "delivered_kwh": round(float(s["by_home_kwh"].get(h, 0.0)), 3), "kind": rec["kind"],
-                                  "rule": sp["rule"]}}
+                                  "rule": sp["rule"], **({"top_up": round_no} if again else {})}}
             items.append((h, "on_status", self.m._msg("on_status", h, rec["id"], msg, ttl_s=beckn.TTL_EVIDENCE_S),
-                          f"{self.m.name}:pay:{rec['id']}:{h}"))
-        self.m._broadcast(items)
-        rec["result"] = {"paid_usd": s.get("paid_usd"), "delivered_kwh": s.get("delivered_kwh"), "homes_paid": len(items),
+                          self._mid(h, "on_status", rec["id"], "pay", round_no if again else 0)))
+        rec["result"] = {"paid_usd": s.get("paid_usd"), "delivered_kwh": s.get("delivered_kwh"), "homes_paid": len(paid0),
                          "fee_usd": sp.get("fee")}
-        self.m.log("rt_paid", call_id=rec["id"], usd=s.get("paid_usd"), delivered_kwh=s.get("delivered_kwh"), homes=len(items))
+        self.m.log("rt_paid", call_id=rec["id"], usd=s.get("paid_usd"), delivered_kwh=s.get("delivered_kwh"), homes=len(items), top_up=again)
+        rec["lacking"] = missing
+        self.m._broadcast(items)                            # last, as in the sale: worked out first, then paid
+        if rec["lacking"] and not again:
+            self.m.log("rt_readings_missing", call_id=rec["id"], nodes=len(rec["lacking"]), first=sorted(rec["lacking"])[:8])
+        if again:
+            rec["top_ups"] = round_no
+            return f"call {rec['id']}: top-up to {len(items)} homes"
         self.explain(rec)
         return f"call {rec['id']}: {s.get('paid_usd')} USD to {len(items)} homes"
+
+    def lacking(self, rec: dict[str, Any], read: dict[str, list[str]] | None) -> dict[str, list[str]]:
+        """The half hours a dispatched node owed this call that its buyer has no reading for. A call pays on readings too, and a node with nothing
+        missing from the sale, or none in it, is never asked by the sale's own chase."""
+        if read is None or rec["kind"] == "gap":
+            return {}
+        end, out = rec.get("end_early") or rec["end"], {}
+        for h, steps in rec["alloc"].items():
+            halves: dict[str, float] = {}
+            for t, kw in steps.items():
+                if t < end:
+                    k = t[:14] + ("00" if t[14:16] < "30" else "30")
+                    halves[k] = halves.get(k, 0.0) + kw / 2.0
+            miss = sorted(k for k, v in halves.items() if v > 1e-3 and k not in (read.get(h) or ()))
+            if miss:
+                out[h] = miss
+        return out
+
+    def chase(self, now: str) -> None:
+        """Asks the nodes a call settled without to send its readings again. What comes in is paid as a top-up (rt_buyer.settle_again)."""
+        wall, floor = time.time(), 0.0 if self.m.cfg.get("sync_broadcast") else float(self.m.cfg.get("readings_chase_wall_seconds", 120))
+        for rec in self.calls.values():
+            if not rec.get("lacking") or now >= beckn.add_minutes(rec["end"], CHASE_FOR_MIN):
+                continue
+            n = rec.get("chases", 0)
+            if rec.get("chased_at") and (now < beckn.add_minutes(rec["chased_at"], CHASE_EVERY_MIN * 2 ** n) or wall < rec["chased_wall"] + floor):
+                continue
+            rec["chased_at"], rec["chased_wall"], rec["chases"] = now, wall, n + 1
+            self.m._broadcast([self._item(h, "status", rec["id"], {"readings_wanted": {"event_id": rec["id"], "contract_id": None, "slots": []}}, "chase", n + 1) for h in sorted(rec["lacking"])])
+            self.m.log("rt_readings_chased", call_id=rec["id"], round=n + 1, nodes=len(rec["lacking"]))
 
     def abnormal_slots(self, ev: dict[str, Any]) -> dict[str, list[int]]:
         """Half hours a member's meter can't be paid on: load that fell because a building closed isn't a cut it made."""
@@ -410,7 +560,8 @@ class RtDesk:
 
     def premiums(self, ev: dict[str, Any], sp: dict[str, Any], delivered: dict[str, float], committed_kwh) -> None:
         """A gap's helper was asked at a rising price, so it's paid it. The event pays the slot's price. The step up on the kWh it delivered
-        beyond its booking comes out of the coordinator's keep, and never takes more than the keep. On the pool only."""
+        beyond its booking comes out of the coordinator's keep, and never takes more than the keep. The buyer's bill doesn't move, so a day with a premium keeps that much less
+        than the book's part of the bill. On the pool only."""
         if not getattr(self.m, "pooled", False):
             return
         book, add, left = st.price_book()["x"], {}, {}
@@ -585,7 +736,7 @@ class RtDesk:
         who = sorted((h for h, r in self.reports.items() if any(t in need for t in r)),
                      key=lambda h: -max(self.reports[h].values(), default=0.0))
         ts = sorted(need)
-        gid = f"gap-{ts[0].replace(' ', 'T')}-{uuid.uuid4().hex[:4]}"
+        gid = f"gap-{ts[0].replace(' ', 'T')}-{ids.digest(self.play(), len(self.calls))[:6]}"      # the play and the desk's own count: a restart that finds the same gap names it the same
         reporters = {h for h, r in self.reports.items() if any(t > now for t in r)}
         parent, helpers = self._parent(ts[0], who[0] if who else "")
         helpers = [h for h in helpers if h not in reporters]
@@ -620,6 +771,8 @@ class RtDesk:
         busy = any(r["kind"] == "gap" and r["phase"] == "asking" for r in self.calls.values())
         if self.dirty and not busy and (self.checked_at is None or now >= beckn.add_minutes(self.checked_at, 5)):
             self.check()
+        if self._quiet():
+            self.chase(now)
 
     def summary(self) -> list[dict[str, Any]]:
         return [{**{k: r.get(k) for k in ("id", "kind", "start", "end", "kw", "price", "phase", "confirmed_kw", "short_kw",

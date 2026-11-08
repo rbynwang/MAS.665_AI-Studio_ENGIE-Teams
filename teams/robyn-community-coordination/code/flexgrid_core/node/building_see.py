@@ -14,6 +14,7 @@ import datetime as dt
 import math
 from typing import Any
 
+from . import owner
 from . import tools as T
 from .building_guard import EMPTY_C, OPEN_C, RECOVER_MIN, zone_kw
 from .see import floor2, hhmm, window_mean
@@ -22,6 +23,17 @@ SESSION_KW = 5.4          # one EV session at the shopping center: 10.8 kW over 
 EASED_SHARE = .5          # zones count as set to coast once this share of the cooling has an offset
 PRE_RAN_C = .3            # zones this far under normal: pre-cool ran, which a stop needs (its card's before_the_call)
 HOT_C = 27.0          # from this forecast evening temperature the plant isn't stopped: see_building
+# What the simulated building has no sensor or record for, so it reads as fine here and nowhere else. The guard takes each as a must-have: a node on a real building
+# has to read these or it sends nothing. On a real node none of this table should be left.
+NO_SENSOR = {"set_zone_cooling": {"closet": False, "override": False, "humid": False},
+             "set_zone_standby": {"closet": False, "override": False, "humid": False, "doas_open": False, "sensors": True, "standby_ok": True},
+             "limit_air_handler": {"closet": False, "override": False, "humid": False, "doas": False, "oa_ok": True, "co2_ok": True, "hood": False},
+             "set_plant_demand_limit": {"lab_live": True},
+             "stop_plant_early": {"whole": True},
+             "dim_lights": {"utility": False, "override": False, "shed_ok": True, "egress": False},
+             "switch_plugs": {"override": False, "loads_ok": True},
+             "set_battery": {"utility": False, "generator": False, "other_program": False},
+             "limit_ev_charging": {"control": True}}
 
 
 def steps_of(sim: Any, t0: str, end: str) -> list[str]:
@@ -87,6 +99,16 @@ def see_building(sim: Any, ts: str, sale: dict[str, Any] | None, shelf: list[str
     coast = cool_eased >= EASED_SHARE or any(p.get("stop") for p in plants.values())
     flags = {s: _exception(zm, s, ts) for s in zm.spaces}
     dev: dict[str, dict[str, Any]] = {}
+    lowered: dict[str, str] = {}             # tool -> what a person lowered, in words: the prompt, the tool cards and the site status all say it
+    said = sim.overrides.get("comfort_limit") or {}             # a person's limit: on every room, as the plan holds it on the building's mean
+    open_c = min(OPEN_C, float(said.get("max_rise_c", OPEN_C)))
+    empty_c = min(EMPTY_C, float(said.get("max_rise_away_c", EMPTY_C)))
+    tighter = open_c < OPEN_C or empty_c < EMPTY_C
+    if tighter:
+        lowered["set_zone_cooling"] = f"Zones may run +{open_c:g} C warmer at most where people may be in, and +{empty_c:g} C where empty."
+    fans_left = _left_of_sale(sim, "fans")                      # a zone event shrinks the sale's part of the fans, as it does the plugs'
+    if fans_left < 1:
+        lowered["limit_air_handler"] = f"Only {fans_left * 100:.0f} percent of the fans' usual part can slow now."
 
     def share(spaces: list[str], use: str) -> float:
         return sum(zm.spaces[s]["share"][use] for s in spaces)
@@ -111,8 +133,8 @@ def see_building(sim: Any, ts: str, sale: dict[str, Any] | None, shelf: list[str
         return {x["target"]: bool(x.get("whole")) if clean else (not x.get("whole") and not (held | bad) & set(x["spaces"])) for x in items}
 
     # ---------------------------------------------------------------- the plant
-    mix_zone = {"cool_kw": C, "cap": h.cap, "hours": hours, "pre_c": pre_c, "free_share": free_of(list(zm.spaces))}
-    rise = max(zones.values(), default=0.0) or (EMPTY_C if sale_free else OPEN_C)
+    mix_zone = {"cool_kw": C, "cap": h.cap, "hours": hours, "pre_c": pre_c, "free_share": free_of(list(zm.spaces)), "open_c": open_c}
+    rise = min(empty_c, max(zones.values(), default=0.0) or (EMPTY_C if sale_free else OPEN_C))
     mix = zone_kw(mix_zone, rise) / C if cooling else 0.0
     info: dict[str, dict[str, Any]] = {}
     for t, p in zm.plants.items():
@@ -122,7 +144,7 @@ def see_building(sim: Any, ts: str, sale: dict[str, Any] | None, shelf: list[str
         lab_floor = math.ceil(now * lab * (1 + float(p.get("lab_margin", .10)))) if lab else 0
         best = max([c["floor"] for c in p["chillers"] if c.get("running", True)] + [lab_floor])
         info[t] = {"p": p, "plant_kw": plant_kw, "now": now, "best": best, "sold": kw_cool * mix, "lab": lab, "called": t in plants,
-                   "stop_ok": "stop_plant_early" in shelf and bool(p.get("stop")) and bool(p.get("loop_list")) and cooling and pre_c >= PRE_RAN_C and not hot,
+                   "stop_ok": "stop_plant_early" in shelf and bool(p.get("stop")) and bool(p.get("loop_list")) and cooling and pre_c >= PRE_RAN_C and not hot and not tighter,
                    "cap_kw": max(0.0, min(plant_kw * (1 - best / max(now, 1e-6)), kw_cool * mix)) if cooling else 0.0}
     covers = sum(i["p"]["cool_share"] for i in info.values() if i["called"] or i["stop_ok"] or i["cap_kw"] > 0)
     covered = min(1.0, covers / (sum(p["cool_share"] for p in zm.plants.values()) or 1.0))
@@ -131,7 +153,7 @@ def see_building(sim: Any, ts: str, sale: dict[str, Any] | None, shelf: list[str
         i = info[t]
         p = i["p"]
         dev[f"stop_plant_early:{t}"] = {
-            "tool": "stop_plant_early", "target": t, "running": cooling, "plant_kw": i["plant_kw"], "chillers": p["chillers"], "cleared": bool(p.get("loop_list")), "normal_off": p.get("normal_off"), "pre_ran": pre_c >= PRE_RAN_C,
+            "tool": "stop_plant_early", "target": t, "running": cooling, "plant_kw": i["plant_kw"], "chillers": p["chillers"], "cleared": bool(p.get("loop_list")), "normal_off": p.get("normal_off"), "pre_ran": pre_c >= PRE_RAN_C, "hot": hot, "limit_lowered": tighter,
             "labs": i["lab"] > 0, "shared": not p.get("stop"), "can_give_kw": 0.0 if i["called"] or not i["stop_ok"] else floor2(i["sold"]), "show": i["stop_ok"] and not i["called"]}
     for x in zm.targets.get("set_plant_demand_limit", []):
         t = x["target"]
@@ -140,10 +162,12 @@ def see_building(sim: Any, ts: str, sale: dict[str, Any] | None, shelf: list[str
         want = give if owed is None else min(give, max(0.0, owed))
         now = i["now"]
         pct = max(i["best"], math.ceil(now * (1 - want / max(i["plant_kw"], 1e-6)) - 1e-9))
+        room = max(i["best"], math.ceil(now * (1 - i["cap_kw"] / max(i["plant_kw"], 1e-6)) - 1e-9))     # the deepest cap the comfort room lasts the sale at
         dev[f"set_plant_demand_limit:{t}"] = {
             "tool": "set_plant_demand_limit", "target": t, "running": cooling, "plant_kw": i["plant_kw"], "percent_now": round(now, 1), "chillers": i["p"]["chillers"], "lab_share": i["lab"],
-            "lab_margin": i["p"].get("lab_margin", .10), "lab_live": True, "zones_coast": coast, "cap_percent": pct, "gives_kw": floor2(i["plant_kw"] * (1 - pct / max(now, 1e-6))),
-            "can_give_kw": floor2(give), "floor_percent": i["best"], "ease_with": _ease(zm, shown("set_zone_cooling")), "show": give > 0 and coast and pct < now}
+            "lab_margin": i["p"].get("lab_margin", .10), "computer_room": bool(i["p"].get("computer_room")), "zones_coast": coast, "cap_percent": pct, "gives_kw": floor2(i["plant_kw"] * (1 - pct / max(now, 1e-6))),
+            "can_give_kw": floor2(give), "floor_percent": i["best"], "ease_with": _ease(zm, shown("set_zone_cooling")), "show": give > 0 and coast and pct < now,
+            **({"room_percent": room, "limit_why": f"A deeper cap would pass the comfort limit before the sale ends: {_who_lowered(sim)}."} if tighter else {})}
     plant_waits = any(d["tool"] == "set_plant_demand_limit" and d["can_give_kw"] > 0 and not coast for d in dev.values())
 
     # ---------------------------------------------------------------- zones
@@ -158,11 +182,13 @@ def see_building(sim: Any, ts: str, sale: dict[str, Any] | None, shelf: list[str
             off = _off_plant(zm, sp, w)
             d = {"tool": "set_zone_cooling", "target": t, "spaces": sp, "points": sp, "running": cooling, "state": state, "free_share": round(fr, 3), "cool_kw": C * w, "cap": h.cap * sum(zm.spaces[s]["area"] for s in sp),
                  "hours": hours, "pre_c": pre_c, "plant_covers": covered > 0, "plant_part": (1 - off) * covered, "base_c": base_c, "top_c": zm.limits.get("top_c"),
-                 "top_says": "Store and mall zones stop" if sale_free <= 0 else "Occupied zones stop", "precool_c": zm.limits.get("precool_c", 1.0),
-                 "tenant_fan_kw": _tenant_fans(sim, zm, sp, start, end), "next_booking": _next_booking(zm, sp, steps, end) if state == "free" else None, **_flag(flags, sp),
+                 "top_says": "Store and mall zones stop" if sale_free <= 0 else "Occupied zones stop", "precool_c": min(float(zm.limits.get("precool_c", 1.0)), float(said.get("precool_c", 9.0))),
+                 "tenant_fan_kw": _tenant_fans(sim, zm, sp, start, end) * fans_left, "next_booking": _next_booking(zm, sp, steps, end) if state == "free" else None, **_flag(flags, sp),
                  **_hall(zm, sp, ts, base_c)}
-            limit = EMPTY_C if state in ("free", "part") else OPEN_C
-            kw = zone_kw(d, limit) * (1 - d["plant_part"]) + d["tenant_fan_kw"] if cooling else 0.0
+            limit = empty_c if state in ("free", "part") else open_c
+            if said:                                            # the guard's own check, and its words
+                d.update(limit_c=limit, open_c=open_c, limit_why=f"This zone's limit is +{limit:g} C now: {_who_lowered(sim)}.")
+            kw = zone_kw(d, limit) * (1 - d["plant_part"]) + d["tenant_fan_kw"] * min(1.0, limit / OPEN_C) if cooling else 0.0
             d.update({"can_give_kw": floor2(kw), "unlocks": plant_waits, "show": bool(show.get(t)) and cooling})
             dev[f"set_zone_cooling:{t}"] = d
 
@@ -171,14 +197,14 @@ def see_building(sim: Any, ts: str, sale: dict[str, Any] | None, shelf: list[str
     if "limit_air_handler" in shelf:
         for x in zm.targets["limit_air_handler"]:
             sp = x.get("spaces") or list(zm.spaces)
-            sc = scale_of(sp)
+            sc = scale_of(sp) * fans_left
             kw_now = fans_kw * x["kw_share"]
             now, floor = x["speed_now"], x["floor_percent"]
             done = bool((lev.get("fans") or {}).get(x["target"]))
             eased = not (cooling or "set_zone_standby" in shelf) or bool(set(sp) & (set(zones) | set(standby)))
             dev[f'limit_air_handler:{x["target"]}'] = {
                 "tool": "limit_air_handler", "target": x["target"], "spaces": sp, "kw_now": kw_now * sc, "kw_shown": kw_now, "speed_now": now, "floor_percent": floor, "smoke_ok": x.get("smoke_ok", True),
-                "can_give_kw": 0.0 if done else floor2(kw_now * sc * (1 - (floor / now) ** 3)), "eased": eased, "ease_with": _ease_fans(zm, shown("set_zone_standby"), shown("set_zone_cooling") if cooling else {}), "show": not done and not any(flags[s] for s in sp),
+                "gives_kw": floor2(kw_now * sc * (1 - (floor / now) ** 3)), "can_give_kw": 0.0 if done else floor2(kw_now * sc * (1 - (floor / now) ** 3)), "eased": eased, "ease_with": _ease_fans(zm, shown("set_zone_standby"), shown("set_zone_cooling") if cooling else {}), "show": not done and not any(flags[s] for s in sp),
                 "floor_why": "Below this speed booked zones lose their air.", **_flag(flags, sp)}
     if "set_zone_standby" in shelf:
         show = shown("set_zone_standby")
@@ -192,7 +218,8 @@ def see_building(sim: Any, ts: str, sale: dict[str, Any] | None, shelf: list[str
             listed = bool(show.get(x["target"]))
             fr = free_of(sp)
             dev[f'set_zone_standby:{x["target"]}'] = {
-                "tool": "set_zone_standby", "target": x["target"], "spaces": sp, "points": sp, "can_give_kw": 0.0, "free_share": round(fr, 3), "closed": closed, "sensors": True, "standby_ok": True,
+                "tool": "set_zone_standby", "target": x["target"], "spaces": sp, "points": sp, "can_give_kw": 0.0, "free_share": round(fr, 3), "closed": closed,
+                "mall_open": sale_free <= 0 and any(zm.state(s, ts) == "open" for s in sp),
                 "next_booking": _next_booking(zm, sp, steps, end) if fr >= .999 and sale else None, "booked": fr <= .001, "event_here": bool(events), "event": bool(hit), "unlocks": (listed and fans_wait) or bool(hit),
                 "show": ((listed and fans_live) or bool(hit)) and not (fr <= .001 and not hit), **_flag(flags, sp)}
 
@@ -200,14 +227,21 @@ def see_building(sim: Any, ts: str, sale: dict[str, Any] | None, shelf: list[str
     if "dim_lights" in shelf:
         show = shown("dim_lights")
         light_kw = sum(h.light_kw(t) for t in steps) / len(steps) if steps else h.light_kw(ts)
-        lim = float(zm.limits.get("light_pct", 50))
+        top = float(zm.limits.get("light_pct", 50))
+        lim = min(top, floor2(100 * sim.light_limit()))         # the map's limit, or a person's lower one: the same number the controller holds
+        why = f"{lim:g}% is the most open common areas allow." if sale_free <= 0 else f"{lim:g}% is the most the guard allows."
+        if lim < top:
+            why = f"{lim:g}% is the most allowed now: {_who_lowered(sim)}."
+            lowered["dim_lights"] = f"Lights may dim {lim:g} percent at most now, not {top:g}."
+        room = max(0.0, sim.light_limit() - float(lev.get("light_share", 0.0))) * light_kw      # a person's limit is on the whole building, so what's running counts against it
         for x in zm.targets["dim_lights"]:
             sp = x["spaces"]
             kw = light_kw * share(sp, "light")
             sc = scale_of(sp)
+            pct = lim if lim >= top else min(lim, floor2(100 * room / max(kw * sc, 1e-6)))
             dev[f'dim_lights:{x["target"]}'] = {
-                "tool": "dim_lights", "target": x["target"], "spaces": sp, "points": sp, "running": kw > .1, "running_kw": kw, "scale": sc, "limit_pct": lim,
-                "limit_why": f"{lim:g}% is the most open common areas allow." if sale_free <= 0 else f"{lim:g}% is the most the guard allows.", "can_give_kw": floor2(kw * sc * lim / 100),
+                "tool": "dim_lights", "target": x["target"], "spaces": sp, "points": sp, "running": kw > .1, "running_kw": kw, "scale": sc, "limit_pct": pct, "limit_lowered": lim < top,
+                "limit_why": why, "can_give_kw": floor2(kw * sc * pct / 100),
                 "all_empty": False, "show": bool(show.get(x["target"])), **{k: v for k, v in _flag(flags, sp).items() if k != "smoke_ok"}}
     if "switch_plugs" in shelf:
         plugs = window_mean(sim, "plugs", start, end) if sale else 0.0
@@ -218,7 +252,7 @@ def see_building(sim: Any, ts: str, sale: dict[str, Any] | None, shelf: list[str
             done = x["target"] in (lev.get("plugs") or {})
             dev[f'switch_plugs:{x["target"]}'] = {
                 "tool": "switch_plugs", "target": x["target"], "spaces": sp, "holds": x.get("holds", ""), "any_time": bool(x.get("any_time")), "free": free_of(sp, "light") > .01,
-                "can_give_kw": 0.0 if done else floor2(plugs * sold * sc), "show": not done}
+                "gives_kw": floor2(plugs * sold * sc), "can_give_kw": 0.0 if done else floor2(plugs * sold * sc), "show": not done}
 
     # ---------------------------------------------------------------- site
     if "set_battery" in shelf and sim.E > 0:
@@ -241,11 +275,26 @@ def see_building(sim: Any, ts: str, sale: dict[str, Any] | None, shelf: list[str
             "tool": "limit_ev_charging", "target": x["target"], "volts": x["volts"], "can_give_kw": 0.0 if done else floor2(kw), "leaves": x["leaves"], "kw_now": kw,
             "sessions": [{"amps": amps, "leaves": x["leaves"], "need_kwh": 0.0} for _ in range(n)], "show": not done}
 
+    for d in dev.values():
+        for k, v in NO_SENSOR.get(d["tool"], {}).items():
+            d.setdefault(k, v)
+        if d["tool"] in ("set_zone_cooling", "set_zone_standby"):
+            d.setdefault("smoke_ok", True)                      # _exception says so only where the map holds a smoke role
     wk = "weekend" if dt.date.fromisoformat(ts[:10]).weekday() >= 5 else "weekday"
     label = ("Hot " if temp >= 27 else "Cold " if temp <= 5 else "Mild ") + wk
     return {"node": getattr(sim, "cfg", {}).get("name"), "side": "building", "ts": ts, "now": hhmm(ts), "sale": sale, "owed_kw": 0.0 if not sale else float(sale["owed_kw"]), "day": label,
-            "place": zm.m["place"], "alarm": sim.overrides.get("alarm"), "note": sim.overrides.get("note"), "devices": dev, "shelf": list(shelf), "free": free, "cool_kw": C, "fans_kw": fans_kw,
-            "instead": zm.m.get("instead") or {}, "never": zm.m.get("never") or [], "hours": hours}
+            "place": zm.m["place"], "alarm": sim.overrides.get("alarm"), "stopped": bool(sim.overrides.get("stop")), "note": sim.overrides.get("note"), "devices": dev, "shelf": list(shelf), "free": free, "cool_kw": C, "fans_kw": fans_kw,
+            "instead": zm.m.get("instead") or {}, "never": zm.m.get("never") or [], "hours": hours, "lowered": lowered, "lowered_why": f"{_who_lowered(sim).capitalize()}." if lowered else None}
+
+
+def _left_of_sale(sim: Any, key: str) -> float:
+    """The share of the sale's part of this device still there: the building's file against what a zone event left."""
+    base = float((sim.bparams.get("sell") or {}).get(key, 0.0))
+    return float(sim.sell.get(key, base)) / base if base > 0 else 1.0
+
+
+def _who_lowered(sim: Any) -> str:
+    return "an event was added in a sold zone" if sim.overrides.get("zone_event") else "the facility manager lowered a limit"
 
 
 def _exception(zm: Any, s: str, ts: str) -> dict[str, Any]:
@@ -322,8 +371,8 @@ def line(d: dict[str, Any], f: dict[str, Any]) -> str:
         return f'{t} must keep running. Its chillers run at {d["percent_now"]:.0f} percent. A cap of {d["cap_percent"]:.0f} percent gives {d["gives_kw"]:,.0f} kW. Zones are set to coast.{lab}'
     if tool == "set_zone_cooling":
         # one ready number, as the other lines give: with two in the sentence the model picked +3 on one run and +1.5 on the next, and the campus sale moved by 500 kW
-        top = EMPTY_C if d["state"] in ("free", "part") else OPEN_C
-        who = f'{d["free_share"] * 100:.0f}% of its rooms have no booking, and code holds the rest at +1.5 C' if d["state"] == "part" else "it is free" if d["state"] == "free" else "it is open"
+        top = d.get("limit_c", EMPTY_C if d["state"] in ("free", "part") else OPEN_C)
+        who = f'{d["free_share"] * 100:.0f}% of its rooms have no booking, and code holds the rest at +{d.get("open_c", OPEN_C):g} C' if d["state"] == "part" else "it is free" if d["state"] == "free" else "it is open"
         tail = f"An offset of +{top:g} C gives {kw:,.0f} kW." if kw > 0 else f"An offset of +{top:g} C gives no kW of its own."
         need = " The plant can't cap until these zones are eased." if d.get("unlocks") else ""
         return f"{t}: cooling is on, {who}. {tail}{need}"
@@ -336,7 +385,7 @@ def line(d: dict[str, Any], f: dict[str, Any]) -> str:
             return f'{t}: an event was added there, so standby must end. Call set_zone_standby with mode off.'
         return f'{t}: {d["free_share"] * 100:.0f}% of it is free and every room has a working sensor. Standby gives no kW of its own, and lets the fans slow.'
     if tool == "dim_lights":
-        return f'{t}: lights draw {d["running_kw"]:,.0f} kW. A cut of {d["limit_pct"]:.0f} percent gives {kw:,.0f} kW.'
+        return f'{t}: lights draw {d["running_kw"]:,.0f} kW. A cut of {d["limit_pct"]:g} percent gives {kw:,.0f} kW.'
     if tool == "switch_plugs":
         return f'{t}: the group holds {d["holds"]}. Off gives {kw:,.0f} kW.'
     if tool == "limit_ev_charging":
@@ -354,7 +403,8 @@ def render(f: dict[str, Any], owed: float, done: list[str], why: str | None, blo
     if why:
         out.append(f"What changed: {why}")
     if f.get("note"):
-        out.append(f'Manager\'s note: "{f["note"]}"')
+        out.append(f'Manager\'s note: "{owner.quoted(f["note"], owner.NOTE_MAX)}"')
+    out += [f.get("lowered_why") or ""] + list((f.get("lowered") or {}).values())
     out += done
     for d in sorted(f["devices"].values(), key=lambda d: -d.get("can_give_kw", 0.0)):
         if key(d) not in used and can_act(f, d):
